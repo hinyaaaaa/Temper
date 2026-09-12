@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,minimum-scale=1,maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Temper">
+<meta name="theme-color" content="#141C3A" id="theme-color-meta">
+<link rel="apple-touch-icon" id="temper-icon" href="">
+<script id="temper-icon-gen">(function(){
+/* ============================================================
+   ホーム画面アイコン — Temperの「空」そのものを縮図にしたアイコン。
+   歯車やロゴマークではなく、朝焼けのグラデーションに浮かぶ太陽の弧。
+   憲法7条: 天候を評価語で表現しないため、アイコンも中立的な情景とする。
+   ============================================================ */
+function drawIcon(canvas){
+  var S=canvas.width, ctx=canvas.getContext('2d'), r=S*0.22;
+  function roundedRect(){
+    ctx.beginPath();ctx.moveTo(r,0);ctx.lineTo(S-r,0);ctx.arcTo(S,0,S,r,r);
+    ctx.lineTo(S,S-r);ctx.arcTo(S,S,S-r,S,r);ctx.lineTo(r,S);ctx.arcTo(0,S,0,S-r,r);
+    ctx.lineTo(0,r);ctx.arcTo(0,0,r,0,r);ctx.closePath();
+  }
+  roundedRect();
+  var sky=ctx.createLinearGradient(0,0,0,S);
+  sky.addColorStop(0,'#4F97DE');sky.addColorStop(0.55,'#9FD0F2');sky.addColorStop(1,'#FCEEDD');
+  ctx.fillStyle=sky;ctx.fill();
+  ctx.save();roundedRect();ctx.clip();
+  // 太陽
+  var sun=ctx.createRadialGradient(S*0.5,S*0.62,S*0.02,S*0.5,S*0.62,S*0.26);
+  sun.addColorStop(0,'#FFF6E4');sun.addColorStop(0.6,'#F9D9A0');sun.addColorStop(1,'rgba(249,217,160,0)');
+  ctx.fillStyle=sun;ctx.beginPath();ctx.arc(S*0.5,S*0.62,S*0.26,0,Math.PI*2);ctx.fill();
+  // 地平線に沈む弧（水平線でクリップ）
+  ctx.beginPath();ctx.rect(0,S*0.68,S,S*0.32);ctx.clip();
+  ctx.fillStyle='rgba(20,28,58,0.14)';ctx.beginPath();ctx.arc(S*0.5,S*0.68,S*0.02,0,Math.PI*2);ctx.fill();
+  ctx.restore();
+}
+var c=document.createElement('canvas');c.width=180;c.height=180;drawIcon(c);
+var png=c.toDataURL('image/png');
+document.getElementById('temper-icon').href=png;
+['57','72','76','114','120','144','152','180'].forEach(function(sz){
+  var l=document.createElement('link');l.rel='apple-touch-icon';l.setAttribute('sizes',sz+'x'+sz);l.href=png;document.head.appendChild(l);
+});
+})();</script>
+<title>Temper</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Zen+Old+Mincho:wght@400;500;600;700&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   Temper — 空を主役にした学習タスク管理
+   ------------------------------------------------------------
+   デザイン方針:
+     ・空（グラデーション、時間帯×天候で連続的に変化）が唯一のヒーロー。
+     ・UIはガラスの棚として空の上に浮く。ガラス自体は主張しない。
+     ・アクセントカラーはほぼ使わない。使う場所は「今日の負荷」の
+       ごく小さなリングのみ（ember: #F2A65A）。
+     ・タイポ: 見出し・日付はZen Old Mincho（和紙の日記のような質量感）、
+       UIラベルはZen Kaku Gothic New。ALL CAPS・eyebrowラベル・
+       ミドルドット結合・"→"装飾は使わない。
+   ============================================================ */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+
+:root {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --ember: #F2A65A;
+  --ember-dim: rgba(242, 166, 90, 0.28);
+  --r-lg: 26px;
+  --r-md: 18px;
+  --r-sm: 12px;
+  --font-display: 'Zen Old Mincho', serif;
+  --font-ui: 'Zen Kaku Gothic New', 'Hiragino Sans', sans-serif;
+
+  /* テキストトーン（空の明暗に応じてJSがlight/darkを切り替える） */
+  --ink: #26241E;
+  --ink-soft: rgba(38, 36, 30, 0.62);
+  --ink-faint: rgba(38, 36, 30, 0.38);
+  --glass-fill: rgba(255, 255, 255, 0.30);
+  --glass-fill-strong: rgba(255, 255, 255, 0.46);
+  --glass-line: rgba(255, 255, 255, 0.55);
+  --glass-shadow: rgba(30, 24, 10, 0.10);
+}
+:root[data-tone="light"] {
+  --ink: #FBF7EE;
+  --ink-soft: rgba(251, 247, 238, 0.72);
+  --ink-faint: rgba(251, 247, 238, 0.44);
+  --glass-fill: rgba(20, 18, 30, 0.26);
+  --glass-fill-strong: rgba(20, 18, 30, 0.40);
+  --glass-line: rgba(255, 255, 255, 0.16);
+  --glass-shadow: rgba(0, 0, 0, 0.22);
+}
+
+html, body { height: 100%; overflow: hidden; }
+body {
+  font-family: var(--font-ui);
+  color: var(--ink);
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  -webkit-user-select: none;
+  transition: color .6s ease;
+}
+
+/* ============================================================
+   空（背景全面、時間経過で緩やかに変化）
+   ============================================================ */
+#sky {
+  position: fixed; inset: 0; z-index: 0;
+  transition: background 3s ease;
+  overflow: hidden;
+}
+#sky-stars {
+  position: absolute; inset: 0; opacity: 0; transition: opacity 3s ease;
+  background-image:
+    radial-gradient(1.4px 1.4px at 8% 15%, rgba(255,255,255,.9), transparent),
+    radial-gradient(1.1px 1.1px at 22% 40%, rgba(255,255,255,.7), transparent),
+    radial-gradient(1.6px 1.6px at 35% 12%, rgba(255,255,255,.85), transparent),
+    radial-gradient(1px 1px at 50% 28%, rgba(255,255,255,.6), transparent),
+    radial-gradient(1.3px 1.3px at 66% 8%, rgba(255,255,255,.8), transparent),
+    radial-gradient(1px 1px at 78% 33%, rgba(255,255,255,.6), transparent),
+    radial-gradient(1.5px 1.5px at 90% 18%, rgba(255,255,255,.85), transparent),
+    radial-gradient(1px 1px at 14% 55%, rgba(255,255,255,.5), transparent),
+    radial-gradient(1.2px 1.2px at 60% 50%, rgba(255,255,255,.6), transparent),
+    radial-gradient(1px 1px at 85% 60%, rgba(255,255,255,.5), transparent);
+  animation: twinkle 6s ease-in-out infinite;
+}
+#sky[data-time="night"] #sky-stars { opacity: 1; }
+@keyframes twinkle { 0%,100% { opacity: .85; } 50% { opacity: 1; } }
+
+#sky-sun {
+  position: absolute; width: 40vmax; height: 40vmax; border-radius: 50%;
+  left: 50%; top: 62%; transform: translate(-50%, -50%);
+  opacity: .9; filter: blur(2px);
+  transition: opacity 3s ease, background 3s ease, top 6s ease;
+}
+#sky[data-time="night"] #sky-sun,
+#sky[data-condition="rain"] #sky-sun { opacity: 0; }
+
+#sky-clouds { position: absolute; inset: 0; opacity: 0; transition: opacity 2s ease; }
+#sky[data-condition="cloudy"] #sky-clouds,
+#sky[data-condition="rain"] #sky-clouds { opacity: 1; }
+.cloud {
+  position: absolute; border-radius: 999px;
+  background: rgba(255,255,255,0.25);
+  filter: blur(18px);
+  animation: driftCloud 90s linear infinite;
+}
+:root[data-tone="dark-sky"] .cloud { background: rgba(255,255,255,0.08); }
+@keyframes driftCloud { from { transform: translateX(-10vw); } to { transform: translateX(110vw); } }
+
+#sky-rain { position: absolute; inset: 0; opacity: 0; transition: opacity 1.5s ease; pointer-events: none; }
+#sky[data-condition="rain"] #sky-rain { opacity: 1; }
+.rain-drop {
+  position: absolute; top: -10%; width: 1.5px; height: 5vh;
+  background: linear-gradient(rgba(255,255,255,0), rgba(255,255,255,0.35));
+  animation: fallRain linear infinite;
+}
+@keyframes fallRain { to { transform: translateY(120vh); } }
+
+@media (prefers-reduced-motion: reduce) {
+  #sky-stars, .cloud, .rain-drop, #sky-sun { animation: none !important; transition: none !important; }
+}
+
+/* ============================================================
+   アプリ本体（ガラスの棚）
+   ============================================================ */
+#app { position: fixed; inset: 0; z-index: 1; display: flex; flex-direction: column; }
+#main-content {
+  flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  padding: calc(var(--safe-top) + 22px) 18px calc(84px + var(--safe-bottom) + 22px);
+}
+.page-wrap { max-width: 560px; margin: 0 auto; }
+
+/* ---- ガラス共通 ---- */
+.glass {
+  background: var(--glass-fill);
+  backdrop-filter: blur(22px) saturate(140%);
+  -webkit-backdrop-filter: blur(22px) saturate(140%);
+  border: 1px solid var(--glass-line);
+  border-radius: var(--r-lg);
+  box-shadow: 0 8px 28px -8px var(--glass-shadow);
+}
+.glass-strong { background: var(--glass-fill-strong); }
+
+/* ---- ナビゲーション（下部固定、ガラスの錠剤） ---- */
+#nav-bar {
+  position: fixed; left: 50%; bottom: calc(var(--safe-bottom) + 16px);
+  transform: translateX(-50%);
+  z-index: 40; display: flex; gap: 4px; padding: 6px;
+  border-radius: 999px;
+}
+.nav-item {
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  padding: 9px 20px; border: none; background: none; cursor: pointer;
+  color: var(--ink-faint); border-radius: 999px;
+  transition: color .25s ease, background .25s ease;
+  font-family: var(--font-ui); font-size: 10.5px; font-weight: 500;
+}
+.nav-item svg { width: 20px; height: 20px; }
+.nav-item.active { color: var(--ink); background: var(--glass-fill-strong); }
+
+/* ---- 今日画面 ---- */
+.today-head { padding: 4px 6px 22px; }
+.today-date { font-family: var(--font-display); font-size: 22px; font-weight: 500; letter-spacing: .04em; }
+.today-weather-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; color: var(--ink-soft); font-size: 13.5px; }
+.weather-glyph { width: 22px; height: 22px; flex-shrink: 0; }
+
+.load-ring-row { display: flex; align-items: center; gap: 16px; margin: 18px 0 26px; padding: 0 6px; }
+.load-ring-svg { width: 58px; height: 58px; flex-shrink: 0; }
+.load-ring-track { fill: none; stroke: var(--glass-line); stroke-width: 5; }
+.load-ring-fill { fill: none; stroke: var(--ember); stroke-width: 5; stroke-linecap: round; transition: stroke-dashoffset .6s cubic-bezier(.4,0,.2,1); }
+.load-ring-label { font-size: 20px; font-weight: 600; }
+.load-text-main { font-size: 14px; color: var(--ink); }
+.load-text-sub { font-size: 12px; color: var(--ink-faint); margin-top: 2px; }
+
+.task-section-label { font-size: 12px; color: var(--ink-faint); padding: 0 6px 10px; }
+
+/* ---- タスクカード（Liquid Glass） ---- */
+.task-card {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 16px 18px; margin-bottom: 10px;
+  animation: cardIn .4s cubic-bezier(.2,.8,.3,1) both;
+  transition: opacity .35s ease, transform .35s ease;
+}
+.task-card.completing { opacity: 0; transform: scale(.94) translateY(4px); }
+@keyframes cardIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+.task-check {
+  width: 25px; height: 25px; border-radius: 50%; flex-shrink: 0; margin-top: 1px;
+  border: 1.6px solid var(--glass-line); background: none; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: background .2s ease, border-color .2s ease;
+}
+.task-check svg { width: 13px; height: 13px; opacity: 0; transition: opacity .15s ease; }
+.task-check.checked { background: var(--ember); border-color: var(--ember); }
+.task-check.checked svg { opacity: 1; }
+
+.task-main { flex: 1; min-width: 0; }
+.task-title { font-size: 15px; font-weight: 500; line-height: 1.5; }
+.task-meta-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+.task-meta-chip { font-size: 11.5px; color: var(--ink-faint); }
+.task-meta-chip.deadline-near { color: var(--ember); }
+.load-dot-row { display: flex; gap: 2.5px; align-items: center; }
+.load-dot { width: 4px; height: 4px; border-radius: 50%; background: var(--ink-faint); }
+.load-dot.filled { background: var(--ember); }
+
+.empty-state { text-align: center; padding: 60px 20px; color: var(--ink-faint); }
+.empty-state .glyph { font-size: 30px; margin-bottom: 12px; opacity: .7; }
+.empty-state .msg { font-size: 14px; color: var(--ink-soft); }
+
+/* ---- タスク詳細（長押しシート） ---- */
+.sheet-overlay {
+  position: fixed; inset: 0; z-index: 100; background: rgba(10,10,16,.32);
+  display: flex; align-items: flex-end; justify-content: center;
+  opacity: 0; pointer-events: none; transition: opacity .25s ease;
+}
+.sheet-overlay.open { opacity: 1; pointer-events: auto; }
+.sheet {
+  width: 100%; max-width: 560px; padding: 22px 22px calc(26px + var(--safe-bottom));
+  border-radius: 26px 26px 0 0; transform: translateY(100%);
+  transition: transform .32s cubic-bezier(.32,.72,0,1);
+}
+.sheet-overlay.open .sheet { transform: translateY(0); }
+.sheet-title { font-family: var(--font-display); font-size: 19px; margin-bottom: 14px; }
+.sheet-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--glass-line); font-size: 13.5px; }
+.sheet-row:last-of-type { border-bottom: none; }
+.sheet-row-label { color: var(--ink-faint); }
+.sheet-reason { margin-top: 14px; padding: 12px 14px; border-radius: var(--r-sm); background: var(--glass-fill-strong); font-size: 13px; color: var(--ink-soft); line-height: 1.7; }
+.sheet-actions { display: flex; gap: 10px; margin-top: 18px; }
+
+/* ---- タスク一覧画面 ---- */
+.page-title { font-family: var(--font-display); font-size: 21px; font-weight: 500; padding: 4px 6px 18px; }
+.filter-row { display: flex; gap: 8px; padding: 0 6px 16px; }
+.filter-chip {
+  padding: 7px 16px; border-radius: 999px; font-size: 12.5px; cursor: pointer;
+  border: 1px solid var(--glass-line); background: none; color: var(--ink-faint);
+  transition: background .2s ease, color .2s ease;
+}
+.filter-chip.active { background: var(--glass-fill-strong); color: var(--ink); }
+
+.task-list-item {
+  display: flex; align-items: center; gap: 12px; padding: 14px 16px; margin-bottom: 8px;
+}
+.task-list-item.done .task-title { opacity: .4; text-decoration: line-through; }
+.task-list-actions { display: flex; gap: 4px; flex-shrink: 0; }
+.icon-btn {
+  width: 32px; height: 32px; border-radius: 50%; border: none; background: none;
+  color: var(--ink-faint); cursor: pointer; display: flex; align-items: center; justify-content: center;
+  transition: background .15s ease, color .15s ease;
+}
+.icon-btn:active { background: var(--glass-fill-strong); }
+.icon-btn svg { width: 15px; height: 15px; }
+
+.fab {
+  position: fixed; right: 20px; bottom: calc(94px + var(--safe-bottom));
+  width: 54px; height: 54px; border-radius: 50%; z-index: 39;
+  border: none; cursor: pointer; color: var(--ink);
+  display: flex; align-items: center; justify-content: center;
+  transition: transform .15s ease;
+}
+.fab:active { transform: scale(.92); }
+.fab svg { width: 22px; height: 22px; }
+
+/* ---- フォーム / モーダル ---- */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 110; background: rgba(10,10,16,.36);
+  display: flex; align-items: flex-end; justify-content: center;
+  opacity: 0; pointer-events: none; transition: opacity .22s ease;
+}
+.modal-overlay.open { opacity: 1; pointer-events: auto; }
+.modal {
+  width: 100%; max-width: 560px; padding: 22px 22px calc(24px + var(--safe-bottom));
+  border-radius: 26px 26px 0 0; max-height: 88vh; overflow-y: auto;
+  transform: translateY(100%); transition: transform .3s cubic-bezier(.32,.72,0,1);
+}
+.modal-overlay.open .modal { transform: translateY(0); }
+.modal-title { font-family: var(--font-display); font-size: 19px; margin-bottom: 18px; }
+.form-group { margin-bottom: 16px; }
+.form-label { font-size: 12.5px; color: var(--ink-faint); margin-bottom: 7px; display: block; }
+.form-input {
+  width: 100%; padding: 12px 14px; border-radius: var(--r-sm); font-size: 15px;
+  border: 1px solid var(--glass-line); background: var(--glass-fill-strong); color: var(--ink);
+  font-family: var(--font-ui); outline: none;
+}
+.form-input::placeholder { color: var(--ink-faint); }
+.load-slider-row { display: flex; align-items: center; gap: 12px; }
+.load-slider-row input[type="range"] { flex: 1; accent-color: var(--ember); }
+.load-slider-val { font-size: 16px; font-weight: 600; min-width: 24px; text-align: right; }
+.btn {
+  padding: 12px 20px; border-radius: var(--r-sm); font-size: 14.5px; font-weight: 500;
+  border: none; cursor: pointer; font-family: var(--font-ui); transition: opacity .15s ease, transform .1s ease;
+}
+.btn:active { transform: scale(.97); }
+.btn-primary { background: var(--ember); color: #241605; flex: 1; }
+.btn-secondary { background: var(--glass-fill-strong); color: var(--ink); }
+.btn-full { width: 100%; justify-content: center; }
+.modal-actions { display: flex; gap: 10px; margin-top: 8px; }
+
+/* ---- 設定画面 ---- */
+.settings-section { padding: 16px 18px; margin-bottom: 12px; }
+.settings-label { font-size: 12px; color: var(--ink-faint); margin-bottom: 12px; }
+.settings-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; }
+.settings-row-desc { font-size: 12.5px; color: var(--ink-faint); margin-top: 4px; line-height: 1.6; }
+.toggle {
+  width: 46px; height: 27px; border-radius: 999px; border: none; cursor: pointer;
+  background: var(--glass-fill-strong); position: relative; transition: background .2s ease;
+}
+.toggle::after {
+  content: ''; position: absolute; top: 3px; left: 3px; width: 21px; height: 21px; border-radius: 50%;
+  background: var(--ink); transition: transform .2s cubic-bezier(.4,0,.2,1);
+}
+.toggle.on { background: var(--ember-dim); }
+.toggle.on::after { transform: translateX(19px); background: var(--ember); }
+
+#toast {
+  position: fixed; left: 50%; bottom: calc(var(--safe-bottom) + 92px); transform: translateX(-50%) translateY(10px);
+  z-index: 200; padding: 11px 22px; border-radius: 999px; font-size: 13px; color: var(--ink);
+  opacity: 0; transition: opacity .2s ease, transform .2s ease; pointer-events: none; white-space: nowrap;
+}
+#toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+::-webkit-scrollbar { width: 0; height: 0; }
+</style>
+</head>
+<body>
+
+<div id="sky" data-time="day" data-condition="clear">
+  <div id="sky-sun"></div>
+  <div id="sky-clouds"></div>
+  <div id="sky-rain"></div>
+  <div id="sky-stars"></div>
+</div>
+
+<div id="app">
+  <div id="main-content"><div class="page-wrap" id="page-root"></div></div>
+
+  <nav id="nav-bar" class="glass">
+    <button class="nav-item active" data-page="today" onclick="Temper.navigateTo('today')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.2"/><line x1="12" y1="2.5" x2="12" y2="4.5"/><line x1="12" y1="19.5" x2="12" y2="21.5"/><line x1="4.2" y1="4.2" x2="5.6" y2="5.6"/><line x1="18.4" y1="18.4" x2="19.8" y2="19.8"/><line x1="2.5" y1="12" x2="4.5" y2="12"/><line x1="19.5" y1="12" x2="21.5" y2="12"/><line x1="4.2" y1="19.8" x2="5.6" y2="18.4"/><line x1="18.4" y1="5.6" x2="19.8" y2="4.2"/></svg>
+      今日
+    </button>
+    <button class="nav-item" data-page="tasks" onclick="Temper.navigateTo('tasks')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></svg>
+      タスク
+    </button>
+    <button class="nav-item" data-page="settings" onclick="Temper.navigateTo('settings')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+      設定
+    </button>
+  </nav>
+</div>
+
+<!-- タスク詳細シート（長押しで開く、SPEC §11） -->
+<div class="sheet-overlay" id="detail-sheet">
+  <div class="sheet glass glass-strong" id="detail-sheet-body"></div>
+</div>
+
+<!-- タスク追加/編集モーダル -->
+<div class="modal-overlay" id="modal-task">
+  <div class="modal glass glass-strong">
+    <div class="modal-title" id="modal-task-title">タスクを追加</div>
+    <div class="form-group">
+      <label class="form-label">タイトル</label>
+      <input type="text" id="input-title" class="form-input" placeholder="例：英単語 30個" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false">
+    </div>
+    <div class="form-group">
+      <label class="form-label">説明（任意）</label>
+      <input type="text" id="input-description" class="form-input" placeholder="補足があれば" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false">
+    </div>
+    <div class="form-group">
+      <label class="form-label">期限（任意）</label>
+      <input type="date" id="input-deadline" class="form-input">
+    </div>
+    <div class="form-group">
+      <label class="form-label">解禁日（任意）</label>
+      <input type="date" id="input-unlock" class="form-input">
+    </div>
+    <div class="form-group">
+      <label class="form-label">負荷（1〜10、自分の感覚で）</label>
+      <div class="load-slider-row">
+        <input type="range" id="input-load" min="1" max="10" step="1" value="4" oninput="Temper.onLoadSliderInput(this.value)">
+        <span class="load-slider-val" id="load-slider-val">4</span>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="Temper.closeTaskModal()">キャンセル</button>
+      <button class="btn btn-primary" onclick="Temper.saveTaskFromModal()">保存</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="glass glass-strong"></div>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
