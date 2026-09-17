@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,minimum-scale=1,maximum-scale=1">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Temper">
 <meta name="theme-color" content="#141C3A" id="theme-color-meta">
@@ -113,54 +114,51 @@ body {
 }
 #sky-stars {
   position: absolute; inset: 0; opacity: 0; transition: opacity 3s ease;
-  background-image:
-    radial-gradient(1.4px 1.4px at 8% 15%, rgba(255,255,255,.9), transparent),
-    radial-gradient(1.1px 1.1px at 22% 40%, rgba(255,255,255,.7), transparent),
-    radial-gradient(1.6px 1.6px at 35% 12%, rgba(255,255,255,.85), transparent),
-    radial-gradient(1px 1px at 50% 28%, rgba(255,255,255,.6), transparent),
-    radial-gradient(1.3px 1.3px at 66% 8%, rgba(255,255,255,.8), transparent),
-    radial-gradient(1px 1px at 78% 33%, rgba(255,255,255,.6), transparent),
-    radial-gradient(1.5px 1.5px at 90% 18%, rgba(255,255,255,.85), transparent),
-    radial-gradient(1px 1px at 14% 55%, rgba(255,255,255,.5), transparent),
-    radial-gradient(1.2px 1.2px at 60% 50%, rgba(255,255,255,.6), transparent),
-    radial-gradient(1px 1px at 85% 60%, rgba(255,255,255,.5), transparent);
-  animation: twinkle 6s ease-in-out infinite;
+  pointer-events: none;
 }
-#sky[data-time="night"] #sky-stars { opacity: 1; }
-@keyframes twinkle { 0%,100% { opacity: .85; } 50% { opacity: 1; } }
+.star {
+  position: absolute; border-radius: 50%; background: #fff;
+  animation: twinkle-star ease-in-out infinite;
+}
+@keyframes twinkle-star { 0%,100% { opacity: .35; transform: scale(1); } 50% { opacity: 1; transform: scale(1.3); } }
 
 #sky-sun {
-  position: absolute; width: 40vmax; height: 40vmax; border-radius: 50%;
-  left: 50%; top: 62%; transform: translate(-50%, -50%);
-  opacity: .9; filter: blur(2px);
-  transition: opacity 3s ease, background 3s ease, top 6s ease;
+  position: absolute; border-radius: 50%;
+  transform: translate(-50%, -50%);
+  filter: blur(1px);
+  transition: opacity 3s ease, background 3s ease, left 8s ease, top 8s ease, width 3s ease, height 3s ease;
+  pointer-events: none;
 }
-#sky[data-time="night"] #sky-sun,
-#sky[data-condition="rain"] #sky-sun { opacity: 0; }
 
-#sky-clouds { position: absolute; inset: 0; opacity: 0; transition: opacity 2s ease; }
-#sky[data-condition="cloudy"] #sky-clouds,
-#sky[data-condition="rain"] #sky-clouds { opacity: 1; }
+#sky-clouds { position: absolute; inset: 0; transition: opacity 2s ease; pointer-events: none; }
 .cloud {
-  position: absolute; border-radius: 999px;
-  background: rgba(255,255,255,0.25);
-  filter: blur(18px);
-  animation: driftCloud 90s linear infinite;
+  position: absolute; height: 11vw; min-height: 44px; max-height: 90px;
+  filter: drop-shadow(0 6px 14px rgba(20,20,30,0.08));
+  animation: driftCloud linear infinite;
 }
-:root[data-tone="dark-sky"] .cloud { background: rgba(255,255,255,0.08); }
-@keyframes driftCloud { from { transform: translateX(-10vw); } to { transform: translateX(110vw); } }
+.cloud svg { width: 100%; height: 100%; display: block; overflow: visible; }
+.cloud-puff { fill: currentColor; transition: fill 2s ease; }
+.cloud { color: rgba(255,255,255,0.6); } /* JSがstyle.backgroundではなくcolorへ差し替える(currentColor経由) */
+@keyframes driftCloud { from { transform: translateX(-40vw); } to { transform: translateX(140vw); } }
 
 #sky-rain { position: absolute; inset: 0; opacity: 0; transition: opacity 1.5s ease; pointer-events: none; }
 #sky[data-condition="rain"] #sky-rain { opacity: 1; }
 .rain-drop {
   position: absolute; top: -10%; width: 1.5px; height: 5vh;
-  background: linear-gradient(rgba(255,255,255,0), rgba(255,255,255,0.35));
+  background: linear-gradient(rgba(255,255,255,0), rgba(255,255,255,0.4));
   animation: fallRain linear infinite;
 }
 @keyframes fallRain { to { transform: translateY(120vh); } }
 
+/* 雨天時は空気が湿って霞むため、空全体にごく薄いヴェールを重ねる */
+#sky-veil {
+  position: absolute; inset: 0; background: rgba(255,255,255,0.04);
+  opacity: 0; transition: opacity 2s ease; pointer-events: none; mix-blend-mode: overlay;
+}
+#sky[data-condition="rain"] #sky-veil { opacity: 1; }
+
 @media (prefers-reduced-motion: reduce) {
-  #sky-stars, .cloud, .rain-drop, #sky-sun { animation: none !important; transition: none !important; }
+  .star, .cloud, .rain-drop, #sky-sun { animation: none !important; transition: none !important; }
 }
 
 /* ============================================================
@@ -355,8 +353,8 @@ body {
 .toggle.on::after { transform: translateX(19px); background: var(--ember); }
 
 #toast {
-  position: fixed; left: 50%; bottom: calc(var(--safe-bottom) + 92px); transform: translateX(-50%) translateY(10px);
-  z-index: 200; padding: 11px 22px; border-radius: 999px; font-size: 13px; color: var(--ink);
+  position: fixed; left: 50%; top: calc(var(--safe-top) + 18px); transform: translateX(-50%) translateY(-10px);
+  z-index: 210; padding: 11px 22px; border-radius: 999px; font-size: 13px; color: var(--ink);
   opacity: 0; transition: opacity .2s ease, transform .2s ease; pointer-events: none; white-space: nowrap;
 }
 #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
@@ -370,6 +368,7 @@ body {
   <div id="sky-sun"></div>
   <div id="sky-clouds"></div>
   <div id="sky-rain"></div>
+  <div id="sky-veil"></div>
   <div id="sky-stars"></div>
 </div>
 

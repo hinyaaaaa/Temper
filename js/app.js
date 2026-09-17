@@ -55,9 +55,18 @@ function navigateTo(page) {
 
 function render() {
   const root = document.getElementById('page-root');
-  if (currentPage === 'today') root.innerHTML = renderTodayPage();
-  else if (currentPage === 'tasks') root.innerHTML = renderTasksPage();
-  else if (currentPage === 'settings') root.innerHTML = renderSettingsPage();
+  try {
+    if (currentPage === 'today') root.innerHTML = renderTodayPage();
+    else if (currentPage === 'tasks') root.innerHTML = renderTasksPage();
+    else if (currentPage === 'settings') root.innerHTML = renderSettingsPage();
+  } catch (err) {
+    // 画面が真っ白のまま原因不明で止まる事故を防ぐため、失敗時は
+    // エラー内容を画面に出す（無音の失敗より、目に見える失敗の方が
+    // 復旧しやすいという判断。本番相当でも最低限の可視化は残す）。
+    console.error('[Temper] render failed', err);
+    root.innerHTML = `<div class="empty-state glass"><div class="glyph">⚠</div><div class="msg">表示中にエラーが発生しました：${String(err && err.message || err)}</div></div>`;
+  }
+  updateFab();
 }
 
 /* ------------------------------------------------------------
@@ -454,32 +463,132 @@ function applySky() {
   sky.dataset.time = timeOfDay;
   sky.dataset.condition = condition;
 
-  const [top, mid, bottom] = Weather.getSkyGradient(timeOfDay, condition);
-  sky.style.background = `linear-gradient(180deg, ${top} 0%, ${mid} 55%, ${bottom} 100%)`;
+  const profile = Weather.getSkyProfile(timeOfDay, condition);
+
+  // 空本体: 4停止点のグラデーション（従来の3色帯から拡張し、地平線側の
+  // 霞み・天頂側の深みを表現できるようにした）。
+  sky.style.background = `linear-gradient(180deg, ${profile.stops.join(', ')})`;
 
   const tone = Weather.getTextToneFor(timeOfDay);
   document.documentElement.dataset.tone = tone === 'light' ? 'light' : '';
-  document.getElementById('theme-color-meta').setAttribute('content', top);
+  document.getElementById('theme-color-meta').setAttribute('content', profile.stops[0].split(' ')[0]);
 
+  // 太陽/月: 単なる円ではなく「光源の色 → 光暈 → 透明」の同心円グラデーションを
+  // 実際の位置(x,y)・大きさ・強さに応じて配置する。雨天では強さをほぼ0にして
+  // 存在感を消すが、要素自体は残す（急なレイアウト変化を避けるため）。
   const sun = document.getElementById('sky-sun');
-  sun.style.background = `radial-gradient(circle, ${bottom === top ? top : mid} 0%, rgba(255,255,255,0) 70%)`;
+  sun.style.left = profile.sun.x + '%';
+  sun.style.top = profile.sun.y + '%';
+  sun.style.width = profile.sun.size + 'vmax';
+  sun.style.height = profile.sun.size + 'vmax';
+  sun.style.opacity = String(profile.sun.strength);
+  sun.style.background = `radial-gradient(circle, ${profile.sun.color} 0%, ${profile.sun.glow} 35%, rgba(255,255,255,0) 72%)`;
 
+  // 雲: 色調(tint)と全体の不透明度をプロファイルに応じて変える。
+  // 個々の雲の形・配置はensureClouds()で一度だけ生成し、以後は
+  // このtint/opacityの変更だけで見た目を切り替える（DOM再生成しない）。
+  const cloudsContainer = document.getElementById('sky-clouds');
+  cloudsContainer.style.opacity = String(profile.cloud.opacity);
   ensureClouds();
+  cloudsContainer.querySelectorAll('.cloud').forEach((c) => { c.style.color = profile.cloud.tint; });
+
+  // 星: 密度は固定（ensureStars）、可視性のみプロファイルで変える。
+  ensureStars();
+  document.getElementById('sky-stars').style.opacity = String(profile.starOpacity);
+
   ensureRain();
 }
 
+/**
+ * 雲を実際に「雲らしい輪郭」で描く。
+ * ------------------------------------------------------------
+ * 旧実装は単一の角丸長方形にblur(18px)をかけるだけで、結果として
+ * ただのぼやけた帯にしかならず、雲として視認できなかった
+ * （自己採点で指摘した「雲・雨が全く見えない」の直接原因）。
+ *
+ * 複数の円を重ねた綿雲のシルエットで再設計したが、初回の実装は
+ * 円同士の重なりが浅く・大きさが均一すぎたため「連なった水玉」に
+ * 見える問題があった（実際にレンダリングして確認した結果の指摘）。
+ * この修正では、中心に大きな塊を置き、左右に段々小さくなる円を
+ * 深く重ねて配置し、さらにSVG全体にわずかなぼかしを掛けて
+ * 継ぎ目を溶かすことで、実際の積雲のような一体感のある輪郭にする。
+ */
 function ensureClouds() {
   const container = document.getElementById('sky-clouds');
   if (container.childElementCount > 0) return;
-  const sizes = [[30, 14, 20, 30], [22, 10, 50, 15], [26, 12, 70, 45]];
-  sizes.forEach(([w, h, top, delay], i) => {
-    const c = document.createElement('div');
-    c.className = 'cloud';
-    c.style.width = w + 'vw'; c.style.height = h + 'vw'; c.style.top = top + '%';
-    c.style.animationDuration = (70 + i * 20) + 's';
-    c.style.animationDelay = -delay + 's';
-    container.appendChild(c);
+  // [cx, cy, rx, ry] — 中心に最大の塊、左右へ向かって小さくかつ
+  // 高さを上げながら重ねることで、積雲らしい「もこっとした」輪郭になる。
+  const puffLayouts = [
+    [50, 6, 26, 15],
+    [32, 10, 22, 13], [68, 10, 22, 13],
+    [18, 14, 16, 10], [82, 14, 16, 10],
+    [40, -6, 20, 13], [60, -6, 20, 13],
+    [8, 18, 11, 7], [92, 18, 11, 7],
+  ];
+  const clouds = [
+    { w: 40, top: 10, duration: 150, delay: -10, driftX: [8, 40] },
+    { w: 30, top: 26, duration: 190, delay: -90, driftX: [55, 78] },
+    { w: 34, top: 4, duration: 165, delay: -140, driftX: [-15, 8] },
+  ];
+  clouds.forEach((cfg) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'cloud';
+    wrap.style.width = cfg.w + 'vw';
+    wrap.style.top = cfg.top + '%';
+    wrap.style.left = cfg.driftX[0] + 'vw';
+    wrap.style.animationDuration = cfg.duration + 's';
+    wrap.style.animationDelay = cfg.delay + 's';
+
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 100 32');
+    svg.setAttribute('preserveAspectRatio', 'none');
+    const filterId = 'cloud-blur-' + Math.random().toString(36).slice(2, 8);
+    const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+    const filter = document.createElementNS('http://www.w3.org/2000/svg', 'filter');
+    filter.setAttribute('id', filterId);
+    filter.setAttribute('x', '-20%'); filter.setAttribute('y', '-20%');
+    filter.setAttribute('width', '140%'); filter.setAttribute('height', '140%');
+    const blur = document.createElementNS('http://www.w3.org/2000/svg', 'feGaussianBlur');
+    blur.setAttribute('stdDeviation', '1.6');
+    filter.appendChild(blur);
+    defs.appendChild(filter);
+    svg.appendChild(defs);
+
+    const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    group.setAttribute('filter', `url(#${filterId})`);
+    puffLayouts.forEach(([cx, cy, rx, ry]) => {
+      const ellipse = document.createElementNS('http://www.w3.org/2000/svg', 'ellipse');
+      ellipse.setAttribute('cx', cx);
+      ellipse.setAttribute('cy', 18 + cy * 0.32);
+      ellipse.setAttribute('rx', rx * 0.42);
+      ellipse.setAttribute('ry', ry * 0.42);
+      ellipse.setAttribute('class', 'cloud-puff');
+      group.appendChild(ellipse);
+    });
+    svg.appendChild(group);
+    wrap.appendChild(svg);
+    container.appendChild(wrap);
   });
+}
+
+/** 星を実際の密度で生成する（従来はbackground-imageの点10個だけで密度不足だった）。 */
+function ensureStars() {
+  const container = document.getElementById('sky-stars');
+  if (container.childElementCount > 0) return;
+  const STAR_COUNT = 90;
+  for (let i = 0; i < STAR_COUNT; i++) {
+    const s = document.createElement('div');
+    s.className = 'star';
+    const size = Math.random() < 0.15 ? 2.4 : Math.random() < 0.5 ? 1.6 : 1.1;
+    s.style.width = size + 'px';
+    s.style.height = size + 'px';
+    s.style.left = Math.random() * 100 + '%';
+    s.style.top = Math.random() * 62 + '%'; // 地平線付近には星を置かない（実際の空の見え方に寄せる）
+    s.style.opacity = String(0.4 + Math.random() * 0.6);
+    s.style.animationDuration = (2.5 + Math.random() * 3.5) + 's';
+    s.style.animationDelay = (Math.random() * 4) + 's';
+    container.appendChild(s);
+  }
 }
 
 function ensureRain() {
@@ -499,15 +608,26 @@ function ensureRain() {
    起動
    ------------------------------------------------------------ */
 function init() {
-  recomputeTodayPlan();
-  applySky(); // まず既定（晴れ・現在時刻）で即座に描画し、体感の遅延を作らない
-  render();
-  refreshWeather();
-  setInterval(applySky, 5 * 60 * 1000); // 時間帯の緩やかな遷移（SPEC §8）
+  if (init._ran) return; // DOMContentLoadedと即時呼び出しの二重発火を防ぐ
+  init._ran = true;
+  try {
+    recomputeTodayPlan();
+    applySky(); // まず既定（晴れ・現在時刻）で即座に描画し、体感の遅延を作らない
+    render();
+    refreshWeather();
+    setInterval(applySky, 5 * 60 * 1000); // 時間帯の緩やかな遷移（SPEC §8）
 
-  document.querySelectorAll('.modal-overlay, .sheet-overlay').forEach((overlay) => {
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.classList.remove('open'); });
-  });
+    document.querySelectorAll('.modal-overlay, .sheet-overlay').forEach((overlay) => {
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.classList.remove('open'); });
+    });
+  } catch (err) {
+    // render()より前の段階（データ読み込み・Planner計算等）で例外が起きると、
+    // 従来は何も表示されないまま画面が真っ白になっていた。ここで捕まえて
+    // 最低限のエラー表示だけは必ず出す。
+    console.error('[Temper] init failed', err);
+    const root = document.getElementById('page-root');
+    if (root) root.innerHTML = `<div class="empty-state glass"><div class="glyph">⚠</div><div class="msg">起動時にエラーが発生しました：${String(err && err.message || err)}</div></div>`;
+  }
 }
 
 window.Temper = {
@@ -518,9 +638,24 @@ window.Temper = {
 };
 
 document.addEventListener('DOMContentLoaded', init);
+// type="module"スクリプトはDOM解析後に実行されるため、この行に到達した時点で
+// 既にDOMContentLoadedが発火済み（readyState !== 'loading'）のケースがある。
+// その場合上のイベントリスナーは一生呼ばれず、画面が真っ白のまま止まる
+// （実機で発生した不具合）。読み込み済みなら即座にinit()を呼ぶ安全策を足す。
+if (document.readyState !== 'loading') init();
 
 // FAB（タスク一覧画面にのみ表示、動的に差し込む）
-const fabObserver = new MutationObserver(() => {
+// ------------------------------------------------------------
+// 従来はMutationObserverでpage-rootの変化を監視して間接的にFABの
+// 表示/非表示を切り替えていたが、これは「render()が呼ばれた」という
+// 直接の事実を、DOM変化の観測という一段回り道した経路で検知する
+// 設計であり、非同期マイクロタスクのタイミングに依存する分だけ
+// 不必要に複雑だった（実機では問題にならないが、挙動を追いにくい）。
+// render()は必ずこのファイル内から呼ばれる（唯一の描画経路）ため、
+// render()の最後で直接呼び出す形に単純化した（挙動は変えていない）。
+function updateFab() {
+  const appEl = document.getElementById('app');
+  if (!appEl) return;
   const existing = document.getElementById('add-task-fab');
   if (currentPage === 'tasks' && !existing) {
     const fab = document.createElement('button');
@@ -528,9 +663,8 @@ const fabObserver = new MutationObserver(() => {
     fab.className = 'fab glass glass-strong';
     fab.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>';
     fab.addEventListener('click', openAddTask);
-    document.getElementById('app').appendChild(fab);
+    appEl.appendChild(fab);
   } else if (currentPage !== 'tasks' && existing) {
     existing.remove();
   }
-});
-fabObserver.observe(document.getElementById('page-root') || document.body, { childList: true, subtree: true });
+}
