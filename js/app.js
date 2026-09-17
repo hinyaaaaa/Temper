@@ -2,8 +2,8 @@
    app.js — Temper アプリケーション制御層
    ------------------------------------------------------------
    責務（憲法6条: 分離の原則）:
-     - store.js（データ）、planner.js（今日の選定）、weather.js（空）を
-       それぞれ「呼ぶだけ」で、ロジック自体はここに書かない。
+     - store.js（データ・設定の解決）、planner.js（今日の選定）、
+       weather.js（空の色）を「呼ぶだけ」で、判断ロジックは書かない。
      - 画面遷移・DOM描画・イベント配線のみを担当する。
    ============================================================ */
 import * as Store from './store.js';
@@ -15,10 +15,10 @@ import * as Weather from './weather.js';
    ------------------------------------------------------------ */
 let state = Store.loadState();
 let currentPage = 'today';
-let currentTodayPlan = null; // { entries, effectiveCapacity, totalLoad, reason }
+let currentTodayPlan = null;
 let editingTaskId = null;
-let detailTaskId = null;
-let weatherState = null; // { condition, temperature, source } | null（取得失敗時）
+let weatherState = null;   // { condition, temperature, source } | null（取得失敗時）
+let pendingImport = null;  // インポート確認中のデータ
 
 const todayStr = () => {
   const d = new Date();
@@ -28,13 +28,17 @@ const todayStr = () => {
 function persist() { Store.saveState(state); }
 
 /* ------------------------------------------------------------
-   今日のプラン再計算（planner.jsを呼ぶだけ、憲法6条）
+   今日のプラン再計算
+   ------------------------------------------------------------
+   「今日は平日か休日か」「その日の容量はいくつか」の解決は store.js が
+   持つ設定の話であり、Plannerは数値だけを受け取る（憲法6条）。
    ------------------------------------------------------------ */
 function recomputeTodayPlan() {
+  const today = todayStr();
   currentTodayPlan = Planner.buildTodayPlan({
     tasks: state.tasks,
-    todayStr: todayStr(),
-    baseCapacity: state.settings.dailyCapacity,
+    todayStr: today,
+    baseCapacity: Store.getCapacityFor(state, today),
     weekdayStats: Store.deriveWeekdayStats(state),
     weekdayPatternStats: Store.deriveWeekdayPatternStats(state),
     patternHistory: Store.derivePatternHistory(state),
@@ -59,18 +63,17 @@ function render() {
     if (currentPage === 'today') root.innerHTML = renderTodayPage();
     else if (currentPage === 'tasks') root.innerHTML = renderTasksPage();
     else if (currentPage === 'settings') root.innerHTML = renderSettingsPage();
+    syncRangeFills(root);
   } catch (err) {
-    // 画面が真っ白のまま原因不明で止まる事故を防ぐため、失敗時は
-    // エラー内容を画面に出す（無音の失敗より、目に見える失敗の方が
-    // 復旧しやすいという判断。本番相当でも最低限の可視化は残す）。
+    // 無音の失敗（真っ白な画面）を許さない。
     console.error('[Temper] render failed', err);
-    root.innerHTML = `<div class="empty-state glass"><div class="glyph">⚠</div><div class="msg">表示中にエラーが発生しました：${String(err && err.message || err)}</div></div>`;
+    root.innerHTML = `<div class="empty-state glass card"><div class="glyph">⚠</div><div class="msg">表示中にエラーが発生しました：${esc(String(err && err.message || err))}</div></div>`;
   }
   updateFab();
 }
 
 /* ------------------------------------------------------------
-   今日画面（SPEC §6: 日付→天候→進捗→タスク→補助情報）
+   小さなユーティリティ
    ------------------------------------------------------------ */
 function esc(s) {
   const d = document.createElement('div');
@@ -82,99 +85,6 @@ function formatDateLabel(dateStr) {
   const d = new Date(dateStr + 'T00:00:00');
   const w = ['日', '月', '火', '水', '木', '金', '土'][d.getDay()];
   return `${d.getMonth() + 1}月${d.getDate()}日（${w}）`;
-}
-
-function weatherGlyphSvg(condition) {
-  if (condition === 'rain') {
-    return '<svg class="weather-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M7 16.5a4.5 4.5 0 01.5-8.98A6 6 0 0119 10.5a3.75 3.75 0 01-.5 7.48"/><line x1="9" y1="19" x2="9" y2="21.5"/><line x1="13" y1="19" x2="13" y2="21.5"/><line x1="17" y1="19" x2="17" y2="21.5"/></svg>';
-  }
-  if (condition === 'cloudy') {
-    return '<svg class="weather-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M7 16.5a4.5 4.5 0 01.5-8.98A6 6 0 0119 10.5a3.75 3.75 0 01-.5 7.48H7z"/></svg>';
-  }
-  return '<svg class="weather-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="4.2"/><line x1="12" y1="2.5" x2="12" y2="4.5"/><line x1="12" y1="19.5" x2="12" y2="21.5"/><line x1="4.2" y1="4.2" x2="5.6" y2="5.6"/><line x1="18.4" y1="18.4" x2="19.8" y2="19.8"/><line x1="2.5" y1="12" x2="4.5" y2="12"/><line x1="19.5" y1="12" x2="21.5" y2="12"/><line x1="4.2" y1="19.8" x2="5.6" y2="18.4"/><line x1="18.4" y1="5.6" x2="19.8" y2="4.2"/></svg>';
-}
-
-function renderTodayPage() {
-  const today = todayStr();
-  if (!currentTodayPlan) recomputeTodayPlan();
-  const plan = currentTodayPlan;
-
-  const pendingEntries = plan.entries.filter((e) => !isTaskDoneToday(e.id));
-  const pct = plan.effectiveCapacity > 0 ? Math.min(1, plan.totalLoad > 0 ? doneLoadToday(plan) / plan.effectiveCapacity : 0) : 0;
-  const circumference = 2 * Math.PI * 24;
-  const offset = circumference * (1 - pct);
-
-  const condition = weatherState ? weatherState.condition : 'clear';
-  const weatherLabel = weatherState
-    ? `${Weather.WEATHER_LABELS[condition] || '晴れ'}${weatherState.temperature != null ? '　' + weatherState.temperature + '℃' : ''}`
-    : '天気を取得できませんでした';
-
-  let taskListHtml;
-  if (!plan.entries.length) {
-    taskListHtml = `<div class="empty-state glass"><div class="glyph">✧</div><div class="msg">今日扱うタスクはありません</div></div>`;
-  } else if (!pendingEntries.length) {
-    taskListHtml = `<div class="empty-state glass"><div class="glyph">✧</div><div class="msg">今日の分はすべて終えました</div></div>`;
-  } else {
-    taskListHtml = pendingEntries.map((entry) => renderTaskCard(entry)).join('');
-  }
-
-  return `
-    <div class="today-head">
-      <div class="today-date">${formatDateLabel(today)}</div>
-      <div class="today-weather-row">${weatherGlyphSvg(condition)}<span>${weatherLabel}</span></div>
-    </div>
-    <div class="load-ring-row">
-      <svg class="load-ring-svg" viewBox="0 0 56 56">
-        <circle class="load-ring-track" cx="28" cy="28" r="24"/>
-        <circle class="load-ring-fill" cx="28" cy="28" r="24" stroke-dasharray="${circumference}" stroke-dashoffset="${offset}" transform="rotate(-90 28 28)"/>
-      </svg>
-      <div>
-        <div class="load-text-main">今日の負荷　<span class="load-ring-label">${doneLoadToday(plan)}</span> / ${plan.effectiveCapacity}</div>
-        <div class="load-text-sub">${pendingEntries.length}件のタスクが残っています</div>
-      </div>
-    </div>
-    <div id="today-task-list">${taskListHtml}</div>
-  `;
-}
-
-function doneLoadToday(plan) {
-  return plan.entries.filter((e) => isTaskDoneToday(e.id)).reduce((sum, e) => sum + e.load, 0);
-}
-
-function isTaskDoneToday(taskId) {
-  const t = state.tasks.find((x) => x.id === taskId);
-  return !!(t && t.done);
-}
-
-function renderTaskCard(entry) {
-  const t = state.tasks.find((x) => x.id === entry.id);
-  if (!t) return '';
-  const chips = [];
-  if (t.deadline) {
-    const days = daysUntilFromToday(t.deadline);
-    const near = days <= 1;
-    chips.push(`<span class="task-meta-chip${near ? ' deadline-near' : ''}">${deadlineLabel(days)}</span>`);
-  }
-  chips.push(`<span class="load-dot-row">${loadDots(t.load)}</span>`);
-
-  return `
-    <div class="task-card glass" data-task-id="${t.id}" ontouchstart="Temper.onCardPressStart('${t.id}')" ontouchend="Temper.onCardPressEnd()" onmousedown="Temper.onCardPressStart('${t.id}')" onmouseup="Temper.onCardPressEnd()" onmouseleave="Temper.onCardPressEnd()">
-      <button class="task-check" onclick="event.stopPropagation();Temper.completeTask('${t.id}')" aria-label="完了にする">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20,6 9,17 4,12"/></svg>
-      </button>
-      <div class="task-main">
-        <div class="task-title">${esc(t.title)}</div>
-        <div class="task-meta-row">${chips.join('')}</div>
-      </div>
-    </div>
-  `;
-}
-
-function loadDots(load) {
-  let html = '';
-  const filled = Math.max(1, Math.round(load / 2));
-  for (let i = 0; i < 5; i++) html += `<span class="load-dot${i < filled ? ' filled' : ''}"></span>`;
-  return html;
 }
 
 function daysUntilFromToday(deadline) {
@@ -190,54 +100,225 @@ function deadlineLabel(days) {
   return `あと${days}日`;
 }
 
+/** レンジ入力の塗り（--fill）を値に合わせる。見た目の一貫性のため全画面共通。 */
+function syncRangeFills(scope) {
+  (scope || document).querySelectorAll('input[type="range"]').forEach(setRangeFill);
+}
+function setRangeFill(el) {
+  const min = Number(el.min || 0), max = Number(el.max || 100), v = Number(el.value || 0);
+  const pct = max > min ? ((v - min) / (max - min)) * 100 : 0;
+  el.style.setProperty('--fill', pct.toFixed(2) + '%');
+}
+
 /* ------------------------------------------------------------
-   長押し検出 → 詳細シート（SPEC §11、常時表示はしない）
+   今日画面（SPEC §6: 日付 → 天候 → 今日の進捗 → 今日のタスク）
+   ------------------------------------------------------------ */
+function weatherGlyphSvg(condition, timeOfDay) {
+  const open = '<svg class="weather-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">';
+  if (condition === 'rain') {
+    return open + '<path d="M7 16.5a4.5 4.5 0 01.5-8.98A6 6 0 0119 10.5a3.75 3.75 0 01-.5 7.48"/><line x1="9" y1="19" x2="9" y2="21.5"/><line x1="13" y1="19" x2="13" y2="21.5"/><line x1="17" y1="19" x2="17" y2="21.5"/></svg>';
+  }
+  if (condition === 'cloudy') {
+    return open + '<path d="M7 16.5a4.5 4.5 0 01.5-8.98A6 6 0 0119 10.5a3.75 3.75 0 01-.5 7.48H7z"/></svg>';
+  }
+  if (timeOfDay === 'night') {
+    return open + '<path d="M20 14.2A8.2 8.2 0 019.8 4 8.4 8.4 0 1020 14.2z"/></svg>';
+  }
+  return open + '<circle cx="12" cy="12" r="4.2"/><line x1="12" y1="2.5" x2="12" y2="4.5"/><line x1="12" y1="19.5" x2="12" y2="21.5"/><line x1="4.2" y1="4.2" x2="5.6" y2="5.6"/><line x1="18.4" y1="18.4" x2="19.8" y2="19.8"/><line x1="2.5" y1="12" x2="4.5" y2="12"/><line x1="19.5" y1="12" x2="21.5" y2="12"/><line x1="4.2" y1="19.8" x2="5.6" y2="18.4"/><line x1="18.4" y1="5.6" x2="19.8" y2="4.2"/></svg>';
+}
+
+/**
+ * 天候行の文言。
+ * 取得に失敗しても「取得できませんでした」というエラー文をヒーローに
+ * 出さない（SPEC §18 / 憲法11条: 失敗しても主機能は静かに続く）。
+ * 分かっている情報だけを状態語として並べる。
+ */
+function skyRowText(timeOfDay) {
+  const parts = [Weather.TIME_LABELS[timeOfDay] || ''];
+  if (weatherState) {
+    parts.push(Weather.WEATHER_LABELS[weatherState.condition] || '晴れ');
+    if (weatherState.temperature != null) parts.push(weatherState.temperature + '℃');
+  }
+  return parts.filter(Boolean).join('　');
+}
+
+function renderTodayPage() {
+  const today = todayStr();
+  if (!currentTodayPlan) recomputeTodayPlan();
+  const plan = currentTodayPlan;
+
+  const pendingEntries = plan.entries.filter((e) => !isTaskDone(e.id));
+  const doneLoad = plan.entries.filter((e) => isTaskDone(e.id)).reduce((sum, e) => sum + e.load, 0);
+  const capacity = plan.effectiveCapacity;
+
+  const C = 2 * Math.PI * 23;
+  const frac = (v) => (capacity > 0 ? Math.min(1, v / capacity) : 0);
+  const plannedOffset = C * (1 - frac(plan.totalLoad));
+  const doneOffset = C * (1 - frac(doneLoad));
+
+  const timeOfDay = Weather.getTimeOfDay();
+  const condition = weatherState ? weatherState.condition : 'clear';
+  const dayType = Store.getDayType(state, today);
+
+  let taskListHtml;
+  if (!plan.entries.length) {
+    taskListHtml = `<div class="empty-state glass card"><div class="glyph">✧</div><div class="msg">今日扱うタスクはありません</div></div>`;
+  } else if (!pendingEntries.length) {
+    taskListHtml = `<div class="empty-state glass card"><div class="glyph">✧</div><div class="msg">今日の分はすべて終えました</div></div>`;
+  } else {
+    taskListHtml = pendingEntries.map((entry) => renderTaskCard(entry)).join('');
+  }
+
+  return `
+    <div class="page-head">
+      <div class="today-date">${formatDateLabel(today)}</div>
+      <div class="today-sky-row">${weatherGlyphSvg(condition, timeOfDay)}<span>${esc(skyRowText(timeOfDay))}</span></div>
+    </div>
+
+    <div class="card glass progress-card">
+      <div class="progress-main">
+        <svg class="load-ring-svg" viewBox="0 0 54 54" aria-hidden="true">
+          <circle class="load-ring-track" cx="27" cy="27" r="23"/>
+          ${plan.totalLoad > 0 ? `<circle class="load-ring-planned" cx="27" cy="27" r="23" stroke-dasharray="${C}" stroke-dashoffset="${plannedOffset}" transform="rotate(-90 27 27)"/>` : ''}
+          ${doneLoad > 0 ? `<circle class="load-ring-done" cx="27" cy="27" r="23" stroke-dasharray="${C}" stroke-dashoffset="${doneOffset}" transform="rotate(-90 27 27)"/>` : ''}
+        </svg>
+        <div class="progress-text">
+          <div class="progress-value">今日の負荷　<b>${plan.totalLoad}</b> / ${capacity}</div>
+          <div class="progress-sub">${pendingEntries.length}件が残っています${doneLoad > 0 ? `　（消化 ${doneLoad}）` : ''}</div>
+        </div>
+      </div>
+      <div class="segmented-row">
+        <span class="segmented-caption">今日の扱い</span>
+        <div class="segmented" role="group" aria-label="今日を平日として扱うか休日として扱うか">
+          <button class="${dayType === 'weekday' ? 'active' : ''}" onclick="Temper.setTodayType('weekday')">平日</button>
+          <button class="${dayType === 'holiday' ? 'active' : ''}" onclick="Temper.setTodayType('holiday')">休日</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-label">今日のタスク</div>
+    <div id="today-task-list">${taskListHtml}</div>
+  `;
+}
+
+function isTaskDone(taskId) {
+  const t = state.tasks.find((x) => x.id === taskId);
+  return !!(t && t.done);
+}
+
+/** 平日 / 休日の手動切り替え（容量が変わるので即座に再選定する） */
+function setTodayType(dayType) {
+  const today = todayStr();
+  if (Store.getDayType(state, today) === dayType) return;
+  Store.setDayType(state, today, dayType);
+  persist();
+  recomputeTodayPlan();
+  render();
+  showToast(dayType === 'holiday' ? '休日として扱います' : '平日として扱います');
+}
+
+/* ------------------------------------------------------------
+   タスクカード（今日画面・タスク画面で同じ部品を使う）
+   ------------------------------------------------------------ */
+function renderTaskCard(entryOrTask, opts = {}) {
+  const t = state.tasks.find((x) => x.id === entryOrTask.id);
+  if (!t) return '';
+  const chips = [];
+  if (t.deadline) {
+    const days = daysUntilFromToday(t.deadline);
+    chips.push(`<span class="task-meta-chip${days <= 1 ? ' urgent' : ''}">${deadlineLabel(days)}</span>`);
+  }
+  if (t.unlockDate && t.unlockDate > todayStr()) {
+    chips.push(`<span class="task-meta-chip">${formatDateLabel(t.unlockDate)}から</span>`);
+  }
+  // 負荷は数字と点の並びの両方で読めるようにする（SPEC §5 / 憲法12条）。
+  // 数字と点を別々のチップにすると同じ情報が二度出て煩いため、ひと塊にする。
+  chips.push(`<span class="load-chip" aria-label="負荷 ${t.load}">負荷 ${t.load}<span class="load-dot-row">${loadDots(t.load)}</span></span>`);
+
+  const actions = opts.withActions ? `
+      <div class="task-list-actions">
+        <button class="icon-btn" onclick="event.stopPropagation();Temper.openEditTask('${t.id}')" aria-label="編集">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5"/><path d="M18.5 2.5a2.1 2.1 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+        </button>
+        <button class="icon-btn" onclick="event.stopPropagation();Temper.deleteTask('${t.id}')" aria-label="削除">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="3,6 5,6 21,6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>
+        </button>
+      </div>` : '';
+
+  return `
+    <div class="task-card glass${t.done ? ' done' : ''}" data-task-id="${t.id}"
+         ontouchstart="Temper.onCardPressStart('${t.id}')" ontouchend="Temper.onCardPressEnd()" ontouchmove="Temper.onCardPressEnd()"
+         onmousedown="Temper.onCardPressStart('${t.id}')" onmouseup="Temper.onCardPressEnd()" onmouseleave="Temper.onCardPressEnd()">
+      <button class="task-check${t.done ? ' checked' : ''}" onclick="event.stopPropagation();Temper.toggleTask('${t.id}')" aria-label="${t.done ? '未完了に戻す' : '完了にする'}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20,6 9,17 4,12"/></svg>
+      </button>
+      <div class="task-main">
+        <div class="task-title">${esc(t.title)}</div>
+        <div class="task-meta-row">${chips.join('')}</div>
+      </div>${actions}
+    </div>
+  `;
+}
+
+/** 負荷を色以外でも読めるようにする（憲法12条・SPEC §20） */
+function loadDots(load) {
+  let html = '';
+  const filled = Math.max(1, Math.round(load / 2));
+  for (let i = 0; i < 5; i++) html += `<span class="load-dot${i < filled ? ' filled' : ''}"></span>`;
+  return html;
+}
+
+/* ------------------------------------------------------------
+   長押し → 詳細シート（SPEC §11、常時表示はしない）
    ------------------------------------------------------------ */
 let pressTimer = null;
 function onCardPressStart(taskId) {
   clearTimeout(pressTimer);
   pressTimer = setTimeout(() => openDetailSheet(taskId), 480);
 }
-function onCardPressEnd() {
-  clearTimeout(pressTimer);
-}
+function onCardPressEnd() { clearTimeout(pressTimer); }
 
 function openDetailSheet(taskId) {
   const t = state.tasks.find((x) => x.id === taskId);
   if (!t) return;
-  detailTaskId = taskId;
   const entry = currentTodayPlan && currentTodayPlan.entries.find((e) => e.id === taskId);
   const reason = entry ? Planner.explainSelection(entry) : null;
 
-  const body = document.getElementById('detail-sheet-body');
-  body.innerHTML = `
+  document.getElementById('detail-sheet-body').innerHTML = `
+    <div class="sheet-grabber"></div>
     <div class="sheet-title">${esc(t.title)}</div>
-    ${t.description ? `<div style="color:var(--ink-soft);font-size:13.5px;margin-bottom:10px">${esc(t.description)}</div>` : ''}
     <div class="sheet-row"><span class="sheet-row-label">期限</span><span>${t.deadline ? formatDateLabel(t.deadline) : 'なし'}</span></div>
     <div class="sheet-row"><span class="sheet-row-label">解禁日</span><span>${t.unlockDate ? formatDateLabel(t.unlockDate) : 'なし'}</span></div>
     <div class="sheet-row"><span class="sheet-row-label">負荷</span><span>${t.load} / 10</span></div>
-    ${reason ? `<div class="sheet-reason">今日選ばれた理由：${esc(reason)}</div>` : ''}
+    <div class="sheet-row"><span class="sheet-row-label">状態</span><span>${t.done ? '完了' : '未完了'}</span></div>
+    ${reason ? `<div class="sheet-note">今日選ばれた理由：${esc(reason)}</div>` : ''}
     <div class="sheet-actions">
-      <button class="btn btn-secondary" style="flex:1" onclick="Temper.closeDetailSheet();Temper.openEditTask('${t.id}')">編集する</button>
-      <button class="btn btn-secondary" style="flex:1" onclick="Temper.closeDetailSheet()">閉じる</button>
+      <button class="btn btn-secondary" onclick="Temper.closeDetailSheet()">閉じる</button>
+      <button class="btn btn-primary" onclick="Temper.closeDetailSheet();Temper.openEditTask('${t.id}')">編集する</button>
     </div>
   `;
   document.getElementById('detail-sheet').classList.add('open');
 }
-function closeDetailSheet() {
-  document.getElementById('detail-sheet').classList.remove('open');
-  detailTaskId = null;
-}
+function closeDetailSheet() { document.getElementById('detail-sheet').classList.remove('open'); }
 
 /* ------------------------------------------------------------
-   タスク完了（SPEC §10: 静かに消える、演出をしない）
+   完了 / 取り消し（SPEC §10: 演出をせず静かに状態が変わる）
    ------------------------------------------------------------ */
-function completeTask(taskId) {
+function toggleTask(taskId) {
   const t = state.tasks.find((x) => x.id === taskId);
   if (!t) return;
-  const cardEl = document.querySelector(`.task-card[data-task-id="${taskId}"]`);
-  if (cardEl) cardEl.classList.add('completing');
 
+  if (t.done) {
+    t.done = false;
+    t.doneDate = null;
+    persist();
+    recomputeTodayPlan();
+    render();
+    return;
+  }
+
+  const cardEl = document.querySelector(`.task-card[data-task-id="${taskId}"]`);
+  if (cardEl && currentPage === 'today') cardEl.classList.add('completing');
   const finish = () => {
     t.done = true;
     t.doneDate = todayStr();
@@ -245,7 +326,7 @@ function completeTask(taskId) {
     persist();
     render();
   };
-  if (cardEl) setTimeout(finish, 320);
+  if (cardEl && currentPage === 'today') setTimeout(finish, 320);
   else finish();
 }
 
@@ -254,20 +335,21 @@ function completeTask(taskId) {
    ------------------------------------------------------------ */
 let taskFilter = 'active';
 function renderTasksPage() {
-  const all = state.tasks;
-  const active = all.filter((t) => !t.done);
-  const done = all.filter((t) => t.done);
+  const active = state.tasks.filter((t) => !t.done);
+  const done = state.tasks.filter((t) => t.done);
   const list = taskFilter === 'active' ? active : done;
 
   const listHtml = list.length
-    ? list.map((t) => renderTaskListItem(t)).join('')
-    : `<div class="empty-state glass"><div class="glyph">✧</div><div class="msg">${taskFilter === 'active' ? 'タスクがありません' : '完了したタスクはまだありません'}</div></div>`;
+    ? list.map((t) => renderTaskCard(t, { withActions: true })).join('')
+    : `<div class="empty-state glass card"><div class="glyph">✧</div><div class="msg">${taskFilter === 'active' ? 'タスクがありません' : '完了したタスクはまだありません'}</div></div>`;
 
   return `
-    <div class="page-title">タスク</div>
-    <div class="filter-row">
-      <button class="filter-chip glass ${taskFilter === 'active' ? 'active' : ''}" onclick="Temper.setTaskFilter('active')">未完了 ${active.length ? `(${active.length})` : ''}</button>
-      <button class="filter-chip glass ${taskFilter === 'done' ? 'active' : ''}" onclick="Temper.setTaskFilter('done')">完了済み</button>
+    <div class="page-head">
+      <div class="page-title">タスク</div>
+    </div>
+    <div class="segmented" style="margin:0 0 var(--sp-3)">
+      <button class="${taskFilter === 'active' ? 'active' : ''}" onclick="Temper.setTaskFilter('active')">未完了 ${active.length}</button>
+      <button class="${taskFilter === 'done' ? 'active' : ''}" onclick="Temper.setTaskFilter('done')">完了済み ${done.length}</button>
     </div>
     <div>${listHtml}</div>
   `;
@@ -275,48 +357,36 @@ function renderTasksPage() {
 
 function setTaskFilter(f) { taskFilter = f; render(); }
 
-function renderTaskListItem(t) {
-  return `
-    <div class="task-list-item glass ${t.done ? 'done' : ''}">
-      <div class="task-main">
-        <div class="task-title">${esc(t.title)}</div>
-        <div class="task-meta-row">
-          ${t.deadline ? `<span class="task-meta-chip">${deadlineLabel(daysUntilFromToday(t.deadline))}</span>` : ''}
-          <span class="load-dot-row">${loadDots(t.load)}</span>
-        </div>
-      </div>
-      <div class="task-list-actions">
-        <button class="icon-btn" onclick="Temper.openEditTask('${t.id}')" aria-label="編集">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5"/><path d="M18.5 2.5a2.1 2.1 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-        </button>
-        <button class="icon-btn" onclick="Temper.deleteTask('${t.id}')" aria-label="削除">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><polyline points="3,6 5,6 21,6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>
-        </button>
-      </div>
-    </div>
-  `;
-}
-
+/** 削除は取り消せないため必ず確認を挟む（憲法16条: データの安全性が最優先） */
 function deleteTask(taskId) {
-  state.tasks = state.tasks.filter((t) => t.id !== taskId);
-  persist();
-  recomputeTodayPlan();
-  render();
-  showToast('削除しました');
+  const t = state.tasks.find((x) => x.id === taskId);
+  if (!t) return;
+  askConfirm({
+    title: 'タスクを削除',
+    body: `「${esc(t.title)}」を削除します。この操作は取り消せません。`,
+    okLabel: '削除する',
+    danger: true,
+    onOk: () => {
+      state.tasks = state.tasks.filter((x) => x.id !== taskId);
+      persist();
+      recomputeTodayPlan();
+      render();
+      showToast('削除しました');
+    },
+  });
 }
 
 /* ------------------------------------------------------------
-   タスク追加/編集モーダル
+   タスク追加 / 編集（SPEC §13: タイトル・期限・解禁日・負荷の4項目）
    ------------------------------------------------------------ */
 function openAddTask() {
   editingTaskId = null;
   document.getElementById('modal-task-title').textContent = 'タスクを追加';
   document.getElementById('input-title').value = '';
-  document.getElementById('input-description').value = '';
   document.getElementById('input-deadline').value = '';
   document.getElementById('input-unlock').value = '';
   setLoadSlider(4);
-  openModal('modal-task');
+  openOverlay('modal-task');
 }
 
 function openEditTask(taskId) {
@@ -325,25 +395,31 @@ function openEditTask(taskId) {
   editingTaskId = taskId;
   document.getElementById('modal-task-title').textContent = 'タスクを編集';
   document.getElementById('input-title').value = t.title || '';
-  document.getElementById('input-description').value = t.description || '';
   document.getElementById('input-deadline').value = t.deadline || '';
   document.getElementById('input-unlock').value = t.unlockDate || '';
   setLoadSlider(t.load || 4);
-  openModal('modal-task');
+  openOverlay('modal-task');
 }
 
 function setLoadSlider(v) {
-  document.getElementById('input-load').value = v;
+  const el = document.getElementById('input-load');
+  el.value = v;
   document.getElementById('load-slider-val').textContent = v;
+  setRangeFill(el);
 }
 function onLoadSliderInput(v) {
   document.getElementById('load-slider-val').textContent = v;
+  setRangeFill(document.getElementById('input-load'));
 }
+function stepLoad(delta) {
+  const el = document.getElementById('input-load');
+  setLoadSlider(Math.max(1, Math.min(10, (parseInt(el.value, 10) || 4) + delta)));
+}
+function clearDateField(id) { document.getElementById(id).value = ''; }
 
 function saveTaskFromModal() {
   const title = document.getElementById('input-title').value.trim();
   if (!title) { showToast('タイトルを入力してください'); return; }
-  const description = document.getElementById('input-description').value.trim();
   const deadline = document.getElementById('input-deadline').value || null;
   const unlockDate = document.getElementById('input-unlock').value || null;
   const load = parseInt(document.getElementById('input-load').value, 10) || 4;
@@ -351,16 +427,15 @@ function saveTaskFromModal() {
   if (editingTaskId) {
     const t = state.tasks.find((x) => x.id === editingTaskId);
     if (t) {
-      t.title = title; t.description = description; t.deadline = deadline;
-      t.unlockDate = unlockDate; t.load = load;
-      t.pattern = Planner.estimatePattern(title, description, Store.derivePatternHistory(state));
+      t.title = title; t.deadline = deadline; t.unlockDate = unlockDate; t.load = load;
+      t.pattern = Planner.estimatePattern(title, t.description, Store.derivePatternHistory(state));
     }
   } else {
     state.tasks.push({
-      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-      title, description, deadline, unlockDate, load,
+      id: Store.newId(),
+      title, description: '', deadline, unlockDate, load,
       done: false, doneDate: null,
-      pattern: Planner.estimatePattern(title, description, Store.derivePatternHistory(state)),
+      pattern: Planner.estimatePattern(title, '', Store.derivePatternHistory(state)),
       createdAt: Date.now(),
     });
   }
@@ -371,46 +446,121 @@ function saveTaskFromModal() {
   showToast(editingTaskId ? '更新しました' : 'タスクを追加しました');
 }
 
-function closeTaskModal() { closeModal('modal-task'); editingTaskId = null; }
-function openModal(id) { document.getElementById(id).classList.add('open'); }
-function closeModal(id) { document.getElementById(id).classList.remove('open'); }
+function closeTaskModal() { closeOverlay('modal-task'); editingTaskId = null; }
+function openOverlay(id) { document.getElementById(id).classList.add('open'); }
+function closeOverlay(id) { document.getElementById(id).classList.remove('open'); }
+
+/* ------------------------------------------------------------
+   確認シート（取り消せない操作の共通入口）
+   ------------------------------------------------------------ */
+function askConfirm({ title, body, okLabel = '実行', danger = false, onOk }) {
+  document.getElementById('confirm-title').textContent = title;
+  document.getElementById('confirm-body').innerHTML = body;
+  const ok = document.getElementById('confirm-ok');
+  const cancel = document.getElementById('confirm-cancel');
+  ok.textContent = okLabel;
+  ok.className = 'btn ' + (danger ? 'btn-danger' : 'btn-primary');
+  ok.onclick = () => { closeOverlay('modal-confirm'); onOk(); };
+  cancel.onclick = () => { closeOverlay('modal-confirm'); };
+  openOverlay('modal-confirm');
+}
 
 /* ------------------------------------------------------------
    設定画面
    ------------------------------------------------------------ */
 function renderSettingsPage() {
-  const cap = state.settings.dailyCapacity;
+  const s = state.settings;
+  const today = todayStr();
+  const dayType = Store.getDayType(state, today);
+  const max = Store.CAPACITY_MAX;
+
   return `
-    <div class="page-title">設定</div>
-    <div class="settings-section glass">
-      <div class="settings-label">1日の負荷キャパシティ</div>
-      <div class="load-slider-row">
-        <input type="range" min="1" max="10" step="1" value="${cap}" oninput="Temper.onCapacityInput(this.value)">
-        <span class="load-slider-val" id="capacity-val">${cap}</span>
-      </div>
-      <div class="settings-row-desc">通常の状態で無理なく扱える1日あたりの負荷の目安です。</div>
+    <div class="page-head">
+      <div class="page-title">設定</div>
     </div>
-    <div class="settings-section glass">
+
+    <div class="card glass">
+      <div class="section-label" style="padding-left:0">1日の負荷キャパシティ</div>
+      <div class="settings-stack">
+        <div>
+          <div class="field-head"><span class="field-label">平日</span></div>
+          <div class="range-field">
+            <button type="button" class="range-step" onclick="Temper.stepCapacity('weekday',-1)" aria-label="平日の容量を下げる">−</button>
+            <input type="range" id="cap-weekday" min="1" max="${max}" step="1" value="${s.capacityWeekday}" oninput="Temper.onCapacityInput('weekday',this.value)">
+            <button type="button" class="range-step" onclick="Temper.stepCapacity('weekday',1)" aria-label="平日の容量を上げる">＋</button>
+            <span class="range-value" id="cap-weekday-val">${s.capacityWeekday}</span>
+          </div>
+        </div>
+        <div>
+          <div class="field-head"><span class="field-label">休日</span></div>
+          <div class="range-field">
+            <button type="button" class="range-step" onclick="Temper.stepCapacity('holiday',-1)" aria-label="休日の容量を下げる">−</button>
+            <input type="range" id="cap-holiday" min="1" max="${max}" step="1" value="${s.capacityHoliday}" oninput="Temper.onCapacityInput('holiday',this.value)">
+            <button type="button" class="range-step" onclick="Temper.stepCapacity('holiday',1)" aria-label="休日の容量を上げる">＋</button>
+            <span class="range-value" id="cap-holiday-val">${s.capacityHoliday}</span>
+          </div>
+        </div>
+      </div>
+      <div class="settings-divider"></div>
+      <div class="segmented-row">
+        <span class="segmented-caption">今日の扱い</span>
+        <div class="segmented">
+          <button class="${dayType === 'weekday' ? 'active' : ''}" onclick="Temper.setTodayType('weekday')">平日</button>
+          <button class="${dayType === 'holiday' ? 'active' : ''}" onclick="Temper.setTodayType('holiday')">休日</button>
+        </div>
+      </div>
+      <div class="settings-desc">${formatDateLabel(today)}は「${dayType === 'holiday' ? '休日' : '平日'}」として計算しています。土日は既定で休日です。</div>
+    </div>
+
+    <div class="card glass">
       <div class="settings-row">
         <div>
-          <div>位置情報から天気を取得</div>
-          <div class="settings-row-desc">オフにすると常に晴れとして表示されます</div>
+          <div class="settings-row-title">位置情報から天気を取得</div>
+          <div class="settings-desc">オフにすると常に晴れとして表示します</div>
         </div>
-        <button class="toggle ${state.settings.weatherAutoLocation ? 'on' : ''}" onclick="Temper.toggleWeatherAuto()"></button>
+        <button class="toggle ${s.weatherAutoLocation ? 'on' : ''}" role="switch" aria-checked="${s.weatherAutoLocation}" onclick="Temper.toggleWeatherAuto()"></button>
       </div>
     </div>
-    <div class="settings-section glass">
-      <div class="settings-label">データ</div>
-      <button class="btn btn-secondary btn-full" onclick="Temper.exportHistory()">学習履歴を書き出す</button>
+
+    <div class="card glass">
+      <div class="section-label" style="padding-left:0">データ</div>
+      <div class="settings-stack">
+        <button class="btn btn-primary btn-full" onclick="Temper.pickImportFile()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="M7 8l5-5 5 5"/><path d="M4 15v4a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg>
+          JSONファイルから読み込む
+        </button>
+        <button class="btn btn-secondary btn-full" onclick="Temper.exportBackup()">バックアップを書き出す</button>
+        <button class="btn btn-secondary btn-full" onclick="Temper.exportHistory()">学習履歴を書き出す</button>
+      </div>
+      <div class="settings-desc">読み込みは追加のみで、今あるタスクや履歴を消しません。TaskNOVA・Flowly・Temperの保存データに対応します。</div>
+    </div>
+
+    <div class="card glass">
+      <div class="settings-row">
+        <div>
+          <div class="settings-row-title">登録済みのタスク</div>
+          <div class="settings-desc">未完了 ${state.tasks.filter((t) => !t.done).length}件　完了 ${state.tasks.filter((t) => t.done).length}件　履歴 ${state.history.length}件</div>
+        </div>
+      </div>
     </div>
   `;
 }
 
-function onCapacityInput(v) {
-  state.settings.dailyCapacity = parseInt(v, 10);
-  document.getElementById('capacity-val').textContent = v;
+function onCapacityInput(kind, v) {
+  const n = parseInt(v, 10);
+  if (kind === 'holiday') state.settings.capacityHoliday = n;
+  else state.settings.capacityWeekday = n;
+  const el = document.getElementById(`cap-${kind}`);
+  el.value = n;
+  setRangeFill(el);
+  document.getElementById(`cap-${kind}-val`).textContent = n;
   persist();
   recomputeTodayPlan();
+}
+
+function stepCapacity(kind, delta) {
+  const cur = kind === 'holiday' ? state.settings.capacityHoliday : state.settings.capacityWeekday;
+  onCapacityInput(kind, Math.max(Store.CAPACITY_MIN, Math.min(Store.CAPACITY_MAX, cur + delta)));
 }
 
 function toggleWeatherAuto() {
@@ -420,13 +570,90 @@ function toggleWeatherAuto() {
   refreshWeather();
 }
 
-function exportHistory() {
-  const json = Store.exportHistoryJson(state);
+/* ------------------------------------------------------------
+   インポート / エクスポート
+   ------------------------------------------------------------ */
+function pickImportFile() {
+  const input = document.getElementById('import-file');
+  input.value = '';
+  input.click();
+}
+
+function onImportFileChosen(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    let data;
+    try {
+      data = JSON.parse(String(reader.result));
+    } catch (e) {
+      showToast('JSONとして読めませんでした');
+      return;
+    }
+    const summary = Store.summarizeImport(state, data);
+    if (!summary) { showToast('対応していない形式のファイルです'); return; }
+
+    pendingImport = data;
+    const lines = [
+      `新しく追加されるタスク：${summary.newTasks}件`,
+      summary.duplicateTasks ? `すでにあるタスク（スキップ）：${summary.duplicateTasks}件` : '',
+      summary.historyEntries ? `学習履歴：${summary.historyEntries}件` : '',
+      (summary.capacityWeekday != null || summary.capacityHoliday != null)
+        ? `キャパシティを更新：平日 ${summary.capacityWeekday ?? '—'}／休日 ${summary.capacityHoliday ?? '—'}`
+        : '',
+    ].filter(Boolean);
+
+    askConfirm({
+      title: 'このデータを読み込みますか',
+      body: lines.map((l) => `<div>${l}</div>`).join('') +
+        '<div style="margin-top:10px;opacity:.75">今あるタスクと履歴は消えません。</div>',
+      okLabel: '読み込む',
+      onOk: runImport,
+    });
+  };
+  reader.onerror = () => showToast('ファイルを読めませんでした');
+  reader.readAsText(file);
+}
+
+function runImport() {
+  if (!pendingImport) return;
+  try {
+    const result = Store.importInto(state, pendingImport);
+    // 取り込んだタスクのPatternを一般モデルで推定しておく
+    state.tasks.forEach((t) => {
+      if (!t.pattern) t.pattern = Planner.estimatePattern(t.title, t.description, Store.derivePatternHistory(state));
+    });
+    state = Store.normalizeState(state);
+    persist();
+    recomputeTodayPlan();
+    render();
+    showToast(`${result.addedTasks}件を読み込みました`);
+  } catch (e) {
+    console.error('[Temper] import failed', e);
+    showToast('読み込みに失敗しました');
+  } finally {
+    pendingImport = null;
+  }
+}
+
+function downloadJson(json, filename) {
   const blob = new Blob([json], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `temper_history_${todayStr()}.json`;
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
   a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function exportHistory() {
+  downloadJson(Store.exportHistoryJson(state), `temper_history_${todayStr()}.json`);
+  showToast('書き出しました');
+}
+function exportBackup() {
+  downloadJson(Store.exportBackupJson(state), `temper_backup_${todayStr()}.json`);
   showToast('書き出しました');
 }
 
@@ -450,7 +677,7 @@ async function refreshWeather() {
     const manual = state.settings.weatherAutoLocation ? null : (state.settings.manualWeatherCondition || 'clear');
     weatherState = await Weather.getWeather(manual);
   } catch (e) {
-    weatherState = null; // 失敗時は呼び出し側でclear扱いにする（applySky内）
+    weatherState = null;
   }
   applySky();
   if (currentPage === 'today') render();
@@ -464,60 +691,45 @@ function applySky() {
   sky.dataset.condition = condition;
 
   const profile = Weather.getSkyProfile(timeOfDay, condition);
-
-  // 空本体: 4停止点のグラデーション（従来の3色帯から拡張し、地平線側の
-  // 霞み・天頂側の深みを表現できるようにした）。
-  sky.style.background = `linear-gradient(180deg, ${profile.stops.join(', ')})`;
+  sky.style.background = Weather.skyGradient(profile);
+  document.getElementById('sky-scrim').style.background = Weather.scrimGradient(profile);
 
   const tone = Weather.getTextToneFor(timeOfDay);
   document.documentElement.dataset.tone = tone === 'light' ? 'light' : '';
-  document.getElementById('theme-color-meta').setAttribute('content', profile.stops[0].split(' ')[0]);
 
-  // 太陽/月: 単なる円ではなく「光源の色 → 光暈 → 透明」の同心円グラデーションを
-  // 実際の位置(x,y)・大きさ・強さに応じて配置する。雨天では強さをほぼ0にして
-  // 存在感を消すが、要素自体は残す（急なレイアウト変化を避けるため）。
+  // ビューポートの外側（Safariの上下バーの裏・セーフエリア）も空の続きで塗る。
+  // ここを塗らないと画面下部に白帯が出る。
+  const root = document.documentElement;
+  root.style.backgroundImage = Weather.canvasGradient(profile);
+  root.style.backgroundAttachment = 'fixed';
+  root.style.backgroundSize = '100% 300%';
+  root.style.backgroundPosition = 'center center';
+  root.style.backgroundRepeat = 'no-repeat';
+  root.style.setProperty('--canvas', Weather.edgeColor(profile));
+  document.getElementById('theme-color-meta').setAttribute('content', Weather.edgeColor(profile));
+
   const sun = document.getElementById('sky-sun');
   sun.style.left = profile.sun.x + '%';
   sun.style.top = profile.sun.y + '%';
   sun.style.width = profile.sun.size + 'vmax';
   sun.style.height = profile.sun.size + 'vmax';
   sun.style.opacity = String(profile.sun.strength);
-  sun.style.background = `radial-gradient(circle, ${profile.sun.color} 0%, ${profile.sun.glow} 35%, rgba(255,255,255,0) 72%)`;
+  sun.style.background = Weather.sunGradient(profile);
 
-  // 雲: 色調(tint)と全体の不透明度をプロファイルに応じて変える。
-  // 個々の雲の形・配置はensureClouds()で一度だけ生成し、以後は
-  // このtint/opacityの変更だけで見た目を切り替える（DOM再生成しない）。
   const cloudsContainer = document.getElementById('sky-clouds');
   cloudsContainer.style.opacity = String(profile.cloud.opacity);
   ensureClouds();
   cloudsContainer.querySelectorAll('.cloud').forEach((c) => { c.style.color = profile.cloud.tint; });
 
-  // 星: 密度は固定（ensureStars）、可視性のみプロファイルで変える。
   ensureStars();
   document.getElementById('sky-stars').style.opacity = String(profile.starOpacity);
-
   ensureRain();
 }
 
-/**
- * 雲を実際に「雲らしい輪郭」で描く。
- * ------------------------------------------------------------
- * 旧実装は単一の角丸長方形にblur(18px)をかけるだけで、結果として
- * ただのぼやけた帯にしかならず、雲として視認できなかった
- * （自己採点で指摘した「雲・雨が全く見えない」の直接原因）。
- *
- * 複数の円を重ねた綿雲のシルエットで再設計したが、初回の実装は
- * 円同士の重なりが浅く・大きさが均一すぎたため「連なった水玉」に
- * 見える問題があった（実際にレンダリングして確認した結果の指摘）。
- * この修正では、中心に大きな塊を置き、左右に段々小さくなる円を
- * 深く重ねて配置し、さらにSVG全体にわずかなぼかしを掛けて
- * 継ぎ目を溶かすことで、実際の積雲のような一体感のある輪郭にする。
- */
+/** 積雲らしい輪郭を、深く重ねた楕円とSVGぼかしで描く */
 function ensureClouds() {
   const container = document.getElementById('sky-clouds');
   if (container.childElementCount > 0) return;
-  // [cx, cy, rx, ry] — 中心に最大の塊、左右へ向かって小さくかつ
-  // 高さを上げながら重ねることで、積雲らしい「もこっとした」輪郭になる。
   const puffLayouts = [
     [50, 6, 26, 15],
     [32, 10, 22, 13], [68, 10, 22, 13],
@@ -526,16 +738,16 @@ function ensureClouds() {
     [8, 18, 11, 7], [92, 18, 11, 7],
   ];
   const clouds = [
-    { w: 40, top: 10, duration: 150, delay: -10, driftX: [8, 40] },
-    { w: 30, top: 26, duration: 190, delay: -90, driftX: [55, 78] },
-    { w: 34, top: 4, duration: 165, delay: -140, driftX: [-15, 8] },
+    { w: 40, top: 10, duration: 150, delay: -10, driftX: 8 },
+    { w: 30, top: 26, duration: 190, delay: -90, driftX: 55 },
+    { w: 34, top: 4, duration: 165, delay: -140, driftX: -15 },
   ];
   clouds.forEach((cfg) => {
     const wrap = document.createElement('div');
     wrap.className = 'cloud';
     wrap.style.width = cfg.w + 'vw';
     wrap.style.top = cfg.top + '%';
-    wrap.style.left = cfg.driftX[0] + 'vw';
+    wrap.style.left = cfg.driftX + 'vw';
     wrap.style.animationDuration = cfg.duration + 's';
     wrap.style.animationDelay = cfg.delay + 's';
 
@@ -571,19 +783,17 @@ function ensureClouds() {
   });
 }
 
-/** 星を実際の密度で生成する（従来はbackground-imageの点10個だけで密度不足だった）。 */
 function ensureStars() {
   const container = document.getElementById('sky-stars');
   if (container.childElementCount > 0) return;
-  const STAR_COUNT = 90;
-  for (let i = 0; i < STAR_COUNT; i++) {
+  for (let i = 0; i < 90; i++) {
     const s = document.createElement('div');
     s.className = 'star';
     const size = Math.random() < 0.15 ? 2.4 : Math.random() < 0.5 ? 1.6 : 1.1;
     s.style.width = size + 'px';
     s.style.height = size + 'px';
     s.style.left = Math.random() * 100 + '%';
-    s.style.top = Math.random() * 62 + '%'; // 地平線付近には星を置かない（実際の空の見え方に寄せる）
+    s.style.top = Math.random() * 62 + '%';
     s.style.opacity = String(0.4 + Math.random() * 0.6);
     s.style.animationDuration = (2.5 + Math.random() * 3.5) + 's';
     s.style.animationDelay = (Math.random() * 4) + 's';
@@ -605,54 +815,12 @@ function ensureRain() {
 }
 
 /* ------------------------------------------------------------
-   起動
+   FAB（タスク画面のみ）
+   ------------------------------------------------------------
+   render() の最後で直接呼ぶ（MutationObserver に頼らない）。
+   DOMに触るコードはトップレベルに置かず、必ず init()/render() の中から
+   呼ぶ — かつて画面が真っ白になった不具合の再発防止。
    ------------------------------------------------------------ */
-function init() {
-  if (init._ran) return; // DOMContentLoadedと即時呼び出しの二重発火を防ぐ
-  init._ran = true;
-  try {
-    recomputeTodayPlan();
-    applySky(); // まず既定（晴れ・現在時刻）で即座に描画し、体感の遅延を作らない
-    render();
-    refreshWeather();
-    setInterval(applySky, 5 * 60 * 1000); // 時間帯の緩やかな遷移（SPEC §8）
-
-    document.querySelectorAll('.modal-overlay, .sheet-overlay').forEach((overlay) => {
-      overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.classList.remove('open'); });
-    });
-  } catch (err) {
-    // render()より前の段階（データ読み込み・Planner計算等）で例外が起きると、
-    // 従来は何も表示されないまま画面が真っ白になっていた。ここで捕まえて
-    // 最低限のエラー表示だけは必ず出す。
-    console.error('[Temper] init failed', err);
-    const root = document.getElementById('page-root');
-    if (root) root.innerHTML = `<div class="empty-state glass"><div class="glyph">⚠</div><div class="msg">起動時にエラーが発生しました：${String(err && err.message || err)}</div></div>`;
-  }
-}
-
-window.Temper = {
-  navigateTo, completeTask, onCardPressStart, onCardPressEnd,
-  openDetailSheet, closeDetailSheet, setTaskFilter,
-  openAddTask, openEditTask, deleteTask, saveTaskFromModal, closeTaskModal,
-  onLoadSliderInput, onCapacityInput, toggleWeatherAuto, exportHistory,
-};
-
-document.addEventListener('DOMContentLoaded', init);
-// type="module"スクリプトはDOM解析後に実行されるため、この行に到達した時点で
-// 既にDOMContentLoadedが発火済み（readyState !== 'loading'）のケースがある。
-// その場合上のイベントリスナーは一生呼ばれず、画面が真っ白のまま止まる
-// （実機で発生した不具合）。読み込み済みなら即座にinit()を呼ぶ安全策を足す。
-if (document.readyState !== 'loading') init();
-
-// FAB（タスク一覧画面にのみ表示、動的に差し込む）
-// ------------------------------------------------------------
-// 従来はMutationObserverでpage-rootの変化を監視して間接的にFABの
-// 表示/非表示を切り替えていたが、これは「render()が呼ばれた」という
-// 直接の事実を、DOM変化の観測という一段回り道した経路で検知する
-// 設計であり、非同期マイクロタスクのタイミングに依存する分だけ
-// 不必要に複雑だった（実機では問題にならないが、挙動を追いにくい）。
-// render()は必ずこのファイル内から呼ばれる（唯一の描画経路）ため、
-// render()の最後で直接呼び出す形に単純化した（挙動は変えていない）。
 function updateFab() {
   const appEl = document.getElementById('app');
   if (!appEl) return;
@@ -661,10 +829,51 @@ function updateFab() {
     const fab = document.createElement('button');
     fab.id = 'add-task-fab';
     fab.className = 'fab glass glass-strong';
-    fab.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>';
+    fab.setAttribute('aria-label', 'タスクを追加');
+    fab.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>';
     fab.addEventListener('click', openAddTask);
     appEl.appendChild(fab);
   } else if (currentPage !== 'tasks' && existing) {
     existing.remove();
   }
 }
+
+/* ------------------------------------------------------------
+   起動
+   ------------------------------------------------------------ */
+function init() {
+  if (init._ran) return;
+  init._ran = true;
+  try {
+    recomputeTodayPlan();
+    applySky();
+    render();
+    refreshWeather();
+    setInterval(applySky, 5 * 60 * 1000);
+
+    document.querySelectorAll('.overlay').forEach((overlay) => {
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.classList.remove('open'); });
+    });
+    document.getElementById('import-file').addEventListener('change', (e) => {
+      onImportFileChosen(e.target.files && e.target.files[0]);
+    });
+  } catch (err) {
+    console.error('[Temper] init failed', err);
+    const root = document.getElementById('page-root');
+    if (root) root.innerHTML = `<div class="empty-state glass card"><div class="glyph">⚠</div><div class="msg">起動時にエラーが発生しました：${esc(String(err && err.message || err))}</div></div>`;
+  }
+}
+
+window.Temper = {
+  navigateTo, toggleTask, onCardPressStart, onCardPressEnd,
+  openDetailSheet, closeDetailSheet, setTaskFilter, setTodayType,
+  openAddTask, openEditTask, deleteTask, saveTaskFromModal, closeTaskModal,
+  onLoadSliderInput, stepLoad, clearDateField,
+  onCapacityInput, stepCapacity, toggleWeatherAuto,
+  pickImportFile, exportHistory, exportBackup,
+};
+
+document.addEventListener('DOMContentLoaded', init);
+// module スクリプトはDOM解析後に走るため、この行の時点で既に
+// DOMContentLoaded が発火済みのことがある。その場合は即座に起動する。
+if (document.readyState !== 'loading') init();

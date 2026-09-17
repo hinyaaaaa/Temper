@@ -100,19 +100,19 @@ const SKY_PROFILES = {
   dawn: {
     clear: {
       stops: ['#FFB37A 0%', '#F9A88C 22%', '#F3C7A8 48%', '#FCE8CE 75%', '#FFF6E8 100%'],
-      sun: { color: '#FFF2D2', glow: '#FFB37A', x: 78, y: 42, size: 26, strength: 0.9 },
+      sun: { color: '#FFF2D2', glow: '#FFB37A', x: 84, y: 21, size: 22, strength: 0.85, core: 0.13 },
       cloud: { tint: 'rgba(255,230,210,0.55)', opacity: 0.0 },
       starOpacity: 0,
     },
     cloudy: {
       stops: ['#C9AFA0 0%', '#D6BEB0 25%', '#E2CFC4 50%', '#EDDFD6 75%', '#F3EAE3 100%'],
-      sun: { color: '#F3D9BE', glow: '#E8C4A0', x: 76, y: 40, size: 34, strength: 0.35 },
+      sun: { color: '#F3D9BE', glow: '#E8C4A0', x: 84, y: 23, size: 30, strength: 0.35, core: 0.03 },
       cloud: { tint: 'rgba(255,255,255,0.5)', opacity: 0.85 },
       starOpacity: 0,
     },
     rain: {
       stops: ['#7C8494 0%', '#8E93A0 25%', '#A3A8B4 50%', '#B9BEC7 75%', '#CBCFD6 100%'],
-      sun: { color: '#B7BCC6', glow: '#9BA0AC', x: 74, y: 38, size: 40, strength: 0.12 },
+      sun: { color: '#B7BCC6', glow: '#9BA0AC', x: 82, y: 25, size: 34, strength: 0.12, core: 0.02 },
       cloud: { tint: 'rgba(120,126,140,0.6)', opacity: 0.95 },
       starOpacity: 0,
     },
@@ -120,19 +120,19 @@ const SKY_PROFILES = {
   day: {
     clear: {
       stops: ['#2E86DE 0%', '#4F97DE 20%', '#7CB9EC 45%', '#B7DDF6 72%', '#E8F5FF 100%'],
-      sun: { color: '#FFFCF0', glow: '#FFF3C4', x: 80, y: 38, size: 20, strength: 1.0 },
+      sun: { color: '#FFFCF0', glow: '#FFF3C4', x: 85, y: 17, size: 16, strength: 0.92, core: 0.15 },
       cloud: { tint: 'rgba(255,255,255,0.85)', opacity: 0.0 },
       starOpacity: 0,
     },
     cloudy: {
       stops: ['#7C93A8 0%', '#8FA3B5 22%', '#A6B8C6 48%', '#C4D1DA 75%', '#DFE7EC 100%'],
-      sun: { color: '#F3F6F8', glow: '#DDE6EC', x: 78, y: 40, size: 32, strength: 0.3 },
+      sun: { color: '#F3F6F8', glow: '#DDE6EC', x: 84, y: 21, size: 27, strength: 0.3, core: 0.03 },
       cloud: { tint: 'rgba(255,255,255,0.92)', opacity: 0.9 },
       starOpacity: 0,
     },
     rain: {
       stops: ['#414F5E 0%', '#4E5C6B 25%', '#606E7C 50%', '#7A8794 75%', '#96A1AB 100%'],
-      sun: { color: '#8A94A0', glow: '#6F7A87', x: 76, y: 40, size: 38, strength: 0.1 },
+      sun: { color: '#8A94A0', glow: '#6F7A87', x: 82, y: 24, size: 32, strength: 0.1, core: 0.02 },
       cloud: { tint: 'rgba(70,78,90,0.7)', opacity: 1.0 },
       starOpacity: 0,
     },
@@ -145,39 +145,44 @@ const SKY_PROFILES = {
       // という「彩度が単調に増減しない」構造を持つ。この谷を作ることで
       // 段差感を消し、自然な移行にした。
       stops: ['#232152 0%', '#413659 26%', '#6B4B62 46%', '#B85C4E 68%', '#E8934A 84%', '#F9C77E 100%'],
-      sun: { color: '#FFE1A6', glow: '#F0895C', x: 50, y: 84, size: 30, strength: 0.85 },
+      // 夕方は地平線側が金色まで明るくなるため、白文字のままでは
+      // 画面下のカードとナビが読めなくなる（実際に描画して発覚）。
+      // 空の絵は保ったまま、下側だけを静かに落とすヴェールを重ねる。
+      scrim: { color: '#100A20', alpha: 0.52, from: 34 },
+      sun: { color: '#FFE1A6', glow: '#F0895C', x: 50, y: 86, size: 24, strength: 0.8, core: 0.14 },
       cloud: { tint: 'rgba(230,150,140,0.5)', opacity: 0.0 },
       starOpacity: 0.25,
     },
     cloudy: {
       stops: ['#282744 0%', '#413B50 26%', '#69525A 46%', '#8F6259 68%', '#AD7359 84%', '#C48F6C 100%'],
-      sun: { color: '#E8B896', glow: '#C97E68', x: 50, y: 80, size: 40, strength: 0.28 },
+      scrim: { color: '#100A20', alpha: 0.38, from: 38 },
+      sun: { color: '#E8B896', glow: '#C97E68', x: 50, y: 84, size: 34, strength: 0.28, core: 0.03 },
       cloud: { tint: 'rgba(140,110,120,0.65)', opacity: 0.85 },
       starOpacity: 0.1,
     },
     rain: {
       stops: ['#1D1B38 0%', '#2C2840 26%', '#403A48 46%', '#534A4E 68%', '#615350 84%', '#6E5F58 100%'],
-      sun: { color: '#7A6E78', glow: '#5C5260', x: 50, y: 78, size: 46, strength: 0.08 },
+      sun: { color: '#7A6E78', glow: '#5C5260', x: 50, y: 82, size: 38, strength: 0.08, core: 0.02 },
       cloud: { tint: 'rgba(50,45,60,0.75)', opacity: 1.0 },
       starOpacity: 0,
     },
   },
   night: {
     clear: {
-      stops: ['#050714 0%', '#0A0F24 28%', '#121A36 55%', '#1C2748 78%', '#293860 100%'],
-      sun: { color: '#E8ECF5', glow: '#B9C4DD', x: 80, y: 40, size: 13, strength: 0.55 },
+      stops: ['#0C112B 0%', '#111838 28%', '#182246 55%', '#213061 78%', '#2E4078 100%'],
+      sun: { color: '#F2F5FB', glow: '#8E9BBC', x: 85, y: 16, size: 9, strength: 0.75, core: 0.30 },
       cloud: { tint: 'rgba(120,135,170,0.3)', opacity: 0.0 },
       starOpacity: 1.0,
     },
     cloudy: {
-      stops: ['#080A16 0%', '#0E121F 28%', '#161C2C 55%', '#20283A 78%', '#2C3548 100%'],
-      sun: { color: '#C7CEDD', glow: '#9AA4BC', x: 78, y: 42, size: 24, strength: 0.15 },
+      stops: ['#0D1020 0%', '#131829 28%', '#1B2236 55%', '#252F45 78%', '#333F58 100%'],
+      sun: { color: '#C7CEDD', glow: '#9AA4BC', x: 84, y: 20, size: 20, strength: 0.15, core: 0.04 },
       cloud: { tint: 'rgba(60,68,90,0.55)', opacity: 0.75 },
       starOpacity: 0.35,
     },
     rain: {
       stops: ['#05060E 0%', '#090B16 28%', '#0E1220 55%', '#141A2A 78%', '#1B2436 100%'],
-      sun: { color: '#8791A8', glow: '#626C82', x: 76, y: 42, size: 30, strength: 0.05 },
+      sun: { color: '#8791A8', glow: '#626C82', x: 82, y: 22, size: 26, strength: 0.05, core: 0.02 },
       cloud: { tint: 'rgba(20,24,36,0.7)', opacity: 0.95 },
       starOpacity: 0,
     },
@@ -197,6 +202,89 @@ export function getSkyProfile(timeOfDay, condition) {
 /** 空の色に対して十分なコントラストを持つテキスト色（明/暗）を返す */
 export function getTextToneFor(timeOfDay) {
   return timeOfDay === 'night' || timeOfDay === 'dusk' ? 'light' : 'dark';
+}
+
+/* ------------------------------------------------------------
+   空の色を CSS の値へ組み立てる（空の見た目はこのファイルが持つ）
+   ------------------------------------------------------------ */
+
+/** 画面いっぱいに敷く空のグラデーション */
+/**
+ * 光源（太陽・月）の同心円グラデーション。
+ * core は「輪郭のはっきりした芯」の半径比。晴天・夜は芯を持たせて
+ * 円盤として見えるようにし、曇天・雨天はほぼ芯を持たせず滲ませる。
+ * 旧実装は常に芯が無く、昼も夜も「ぼんやりした染み」にしか見えず、
+ * カードの上に重なると汚れのように見えていた。
+ */
+export function sunGradient(profile) {
+  const core = profile.sun.core != null ? profile.sun.core : 0.05;
+  return `radial-gradient(circle, ${profile.sun.color} 0%, ${profile.sun.color} ${(core * 100).toFixed(0)}%, `
+       + `${profile.sun.glow} ${(Math.max(core + 0.12, 0.34) * 100).toFixed(0)}%, rgba(255,255,255,0) 72%)`;
+}
+
+export function skyGradient(profile) {
+  return `linear-gradient(180deg, ${profile.stops.join(', ')})`;
+}
+
+/** 天頂側 / 地平線側の単色 */
+export function zenithColor(profile) { return profile.stops[0].split(' ')[0]; }
+export function horizonColor(profile) { return profile.stops[profile.stops.length - 1].split(' ')[0]; }
+
+/**
+ * html（キャンバス）に敷くための、画面の3倍の高さを持つ同じ空。
+ * ------------------------------------------------------------
+ * position:fixed の要素はビューポートの外側（Safariの上下バーの裏や、
+ * ホーム画面から起動したときのセーフエリア）を塗れない。そこが
+ * 既定の白のままだったため、画面下部に白帯が出ていた。
+ *
+ * キャンバスの背景は background-attachment:fixed にするとビューポートを
+ * 基準に配置されるので、「上1/3=天頂色・中央1/3=空そのもの・下1/3=地平線色」
+ * の画像を作り中央をビューポートへ合わせると、上下にはみ出した帯が
+ * それぞれ空の続きの色で塗られる。
+ * app.js はこの戻り値を background-image に入れ、
+ * background-size:100% 300% / position:center / repeat:no-repeat を指定する。
+ */
+export function canvasGradient(profile) {
+  const top = zenithColor(profile);
+  const bottom = edgeColor(profile);
+  const mapped = profile.stops.map((stop) => {
+    const [color, pos] = stop.split(' ');
+    const p = parseFloat(pos);
+    return `${color} ${(100 / 3 + (Number.isFinite(p) ? p : 0) / 3).toFixed(3)}%`;
+  });
+  return `linear-gradient(180deg, ${top} 0%, ${top} 33.333%, ${mapped.join(', ')}, ${bottom} 66.667%, ${bottom} 100%)`;
+}
+
+/* ------------------------------------------------------------
+   下側を落とすヴェール（可読性のため。憲法12条）
+   ------------------------------------------------------------ */
+function hexToRgb(hex) {
+  const h = hex.replace('#', '');
+  return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+}
+function rgbToHex(rgb) {
+  return '#' + rgb.map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join('');
+}
+
+/** ヴェールのCSS。持たないプロファイルでは 'none' を返す。 */
+export function scrimGradient(profile) {
+  const s = profile.scrim;
+  if (!s) return 'none';
+  const [r, g, b] = hexToRgb(s.color);
+  return `linear-gradient(180deg, rgba(${r},${g},${b},0) ${s.from}%, rgba(${r},${g},${b},${s.alpha}) 100%)`;
+}
+
+/**
+ * 画面の一番下で実際に見えている色。
+ * ヴェールを重ねた後の色でないと、セーフエリアやSafariのバーだけが
+ * 明るく浮いて見えるため、必ずこの関数を使う。
+ */
+export function edgeColor(profile) {
+  const base = hexToRgb(horizonColor(profile));
+  const s = profile.scrim;
+  if (!s) return horizonColor(profile);
+  const veil = hexToRgb(s.color);
+  return rgbToHex(base.map((v, i) => v * (1 - s.alpha) + veil[i] * s.alpha));
 }
 
 export const WEATHER_LABELS = {

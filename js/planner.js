@@ -175,7 +175,10 @@ export function computeEffectiveCapacity(baseCapacity, context = {}) {
     factor += Math.max(-CAPACITY_ADJUST_MAX_RATIO, Math.min(CAPACITY_ADJUST_MAX_RATIO, delta));
   }
 
-  return Math.max(1, Math.round(baseCapacity * factor * 10) / 10);
+  // Loadは整数（SPEC §5）なので、容量も整数に丸める。小数のままだと
+  // 画面に「10 / 10.1」のような読みにくい数字が出るうえ、
+  // knapsackSelect が結局 floor するため実質の意味も無い。
+  return Math.max(1, Math.round(baseCapacity * factor));
 }
 
 /* ------------------------------------------------------------

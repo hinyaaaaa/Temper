@@ -1,36 +1,70 @@
 /* ============================================================
    store.js — Temper データストア
    ------------------------------------------------------------
-   憲法10条: 既存の保存データを破壊しない。TaskEngine/Flowly
-   (altair_data キー) の保存形式からの移行処理を提供する。
-   全てローカル完結（外部サーバー無し、SUPPLEMENT §27）。
+   責務（憲法6条）: 保存・読み込み・移行・インポートと、
+   「設定として決まっている値」の解決のみ。
+   Plannerのロジックも画面の都合もここには持ち込まない。
+
+   憲法10条: 既存の保存データを破壊しない。
+     - TaskEngine/Flowly (altair_data) からの自動移行
+     - TaskNOVA / Temper のJSONファイルからの手動インポート（追加のみ）
+   全てローカル完結（外部サーバー無し）。
    ============================================================ */
 
 const STORAGE_KEY = 'temper_data_v1';
 const LEGACY_KEYS = ['altair_data', 'altair_v2', 'altair_v1'];
 
+/** 負荷スケールの上限（SPEC §5: タスクの負荷は1〜10） */
+export const LOAD_MAX = 10;
+/** 1日のキャパシティの上限。休日は複数タスクを積むため負荷上限より広く取る。 */
+export const CAPACITY_MAX = 40;
+export const CAPACITY_MIN = 1;
+
+/**
+ * 旧アプリ(TaskNOVA/Flowly)の負荷は0.5刻みの主観値で、Temperは1〜10の整数。
+ * 2倍して丸めることで刻みを保ったまま整数スケールへ移す。
+ * キャパシティも「同じ倍率」で変換しないと1日に入る件数が変わってしまうため、
+ * 必ずこの定数を共有する（旧実装は負荷を2倍・容量を1/1.6倍しており、
+ * 移行後に1日の分量が実質1/3になる不整合があった）。
+ */
+const LEGACY_LOAD_SCALE = 2;
+
 const STATE_DEFAULTS = {
   tasks: [],
-  // Plannerが記録する履歴（SUPPLEMENT §18）。分析用途のみで、
-  // ユーザー評価には使わない。
+  // Plannerが記録する履歴。分析用途のみで、ユーザー評価には使わない。
   history: [],
   settings: {
-    dailyCapacity: 6, // SPEC §5: 負荷は1〜10。1日の基準容量もこのスケールに合わせる
+    // SPEC §5 の負荷スケールに対する「1日に無理なく扱える量」。
+    // 平日と休日で使える時間が大きく違うため、別々に持つ。
+    capacityWeekday: 6,
+    capacityHoliday: 10,
+    // 既定で休日とみなす曜日（0=日 … 6=土）
+    holidayWeekdays: [0, 6],
+    // 日付単位の手動上書き { 'YYYY-MM-DD': 'weekday' | 'holiday' }
+    dayTypeOverrides: {},
     weatherAutoLocation: true,
-    manualWeatherCondition: null, // 天候取得失敗時のフォールバック用（憲法11条）
+    manualWeatherCondition: null,
   },
-  // 曜日別・曜日×Pattern別の実績統計（SUPPLEMENT §15, §17）。
-  // 生の履歴から都度再集計してもよいが、軽量化のため要約を保持する。
   stats: {
-    weekday: {},        // { [0-6]: { completed:number, missed:number } }
+    weekday: {},         // { [0-6]: { completed:number, missed:number } }
     weekdayPattern: {},  // { "0:memorization": { completed:number, missed:number } }
   },
 };
 
-function deepClone(obj) {
-  return JSON.parse(JSON.stringify(obj));
+/** 手動上書きを無制限に溜めない（過去の分は選定に影響しないため捨ててよい） */
+const OVERRIDE_KEEP_DAYS = 90;
+
+function deepClone(obj) { return JSON.parse(JSON.stringify(obj)); }
+
+function clampInt(v, min, max, fallback) {
+  const n = Math.round(Number(v));
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
 }
 
+/* ------------------------------------------------------------
+   読み書き
+   ------------------------------------------------------------ */
 export function loadState() {
   let raw = null;
   try {
@@ -49,19 +83,62 @@ export function loadState() {
   } catch (e) {
     state = deepClone(STATE_DEFAULTS);
   }
+  return normalizeState(state);
+}
 
+/**
+ * 形の揺れ（古い保存形式・壊れた値）をここで吸収する。
+ * 画面側は normalizeState を通った state しか受け取らない。
+ */
+export function normalizeState(state) {
+  if (!state || typeof state !== 'object') state = {};
   if (!Array.isArray(state.tasks)) state.tasks = [];
   if (!Array.isArray(state.history)) state.history = [];
-  state.settings = { ...STATE_DEFAULTS.settings, ...(state.settings || {}) };
+
+  const s = { ...deepClone(STATE_DEFAULTS.settings), ...(state.settings || {}) };
+
+  // 旧形式: 単一の dailyCapacity しか無かった頃のデータを平日/休日へ展開する。
+  if (state.settings && state.settings.dailyCapacity != null && state.settings.capacityWeekday == null) {
+    const base = clampInt(state.settings.dailyCapacity, CAPACITY_MIN, CAPACITY_MAX, 6);
+    s.capacityWeekday = base;
+    s.capacityHoliday = clampInt(base * 1.6, CAPACITY_MIN, CAPACITY_MAX, base);
+  }
+  delete s.dailyCapacity;
+
+  s.capacityWeekday = clampInt(s.capacityWeekday, CAPACITY_MIN, CAPACITY_MAX, 6);
+  s.capacityHoliday = clampInt(s.capacityHoliday, CAPACITY_MIN, CAPACITY_MAX, 10);
+  if (!Array.isArray(s.holidayWeekdays)) s.holidayWeekdays = [0, 6];
+  if (!s.dayTypeOverrides || typeof s.dayTypeOverrides !== 'object') s.dayTypeOverrides = {};
+  s.weatherAutoLocation = s.weatherAutoLocation !== false;
+  state.settings = s;
+
   state.stats = { ...deepClone(STATE_DEFAULTS.stats), ...(state.stats || {}) };
   if (!state.stats.weekday) state.stats.weekday = {};
   if (!state.stats.weekdayPattern) state.stats.weekdayPattern = {};
 
+  state.tasks = state.tasks.filter((t) => t && typeof t === 'object').map((t) => ({
+    id: String(t.id || newId()),
+    title: String(t.title || ''),
+    description: typeof t.description === 'string' ? t.description : '',
+    deadline: t.deadline || null,
+    unlockDate: t.unlockDate || null,
+    load: clampInt(t.load, 1, LOAD_MAX, 4),
+    done: !!t.done,
+    doneDate: t.doneDate || null,
+    pattern: t.pattern || null,
+    createdAt: Number(t.createdAt) || Date.now(),
+  }));
+
   return state;
+}
+
+export function newId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
 
 export function saveState(state) {
   try {
+    pruneOverrides(state);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     return true;
   } catch (e) {
@@ -69,43 +146,56 @@ export function saveState(state) {
   }
 }
 
-/**
- * TaskEngine/Flowly (altair_data) 形式からの移行（憲法10条）。
- * 旧形式のタスク（once/weekly、load 0.5-5刻み）をTemperの形式
- * （load 1-10整数、deadline/unlockDate/patternを持つ単一タスク型）へ
- * できる範囲で変換する。週次タスクは、Temperがまだ繰り返しタスクを
- * 一級概念として持たないため、当面は「タイトルに(毎週)を付けた通常
- * タスク」として一回だけ移行する（データ消失より重複を許容する）。
- */
+function pruneOverrides(state) {
+  const overrides = state.settings.dayTypeOverrides;
+  const keys = Object.keys(overrides);
+  if (keys.length <= OVERRIDE_KEEP_DAYS) return;
+  keys.sort();
+  keys.slice(0, keys.length - OVERRIDE_KEEP_DAYS).forEach((k) => { delete overrides[k]; });
+}
+
+/* ------------------------------------------------------------
+   平日 / 休日 と、その日のキャパシティ（要件: 平日・休日で分離、手動切替）
+   ------------------------------------------------------------
+   「今日はどちらの容量で考えるか」は設定の解決であってPlannerの
+   判断ではないため、ここに置く（憲法6条）。Plannerは数値だけを受け取る。
+   ------------------------------------------------------------ */
+
+/** @returns {'weekday'|'holiday'} */
+export function getDayType(state, dateStr) {
+  const override = state.settings.dayTypeOverrides[dateStr];
+  if (override === 'weekday' || override === 'holiday') return override;
+  const weekday = new Date(dateStr + 'T00:00:00').getDay();
+  return state.settings.holidayWeekdays.includes(weekday) ? 'holiday' : 'weekday';
+}
+
+/** ユーザーが明示的に切り替えたか（＝曜日の既定と違うか）を画面が知るため */
+export function isDayTypeOverridden(state, dateStr) {
+  return Object.prototype.hasOwnProperty.call(state.settings.dayTypeOverrides, dateStr);
+}
+
+export function setDayType(state, dateStr, dayType) {
+  const weekday = new Date(dateStr + 'T00:00:00').getDay();
+  const natural = state.settings.holidayWeekdays.includes(weekday) ? 'holiday' : 'weekday';
+  if (dayType === natural) delete state.settings.dayTypeOverrides[dateStr];
+  else state.settings.dayTypeOverrides[dateStr] = dayType;
+}
+
+export function getCapacityFor(state, dateStr) {
+  return getDayType(state, dateStr) === 'holiday'
+    ? state.settings.capacityHoliday
+    : state.settings.capacityWeekday;
+}
+
+/* ------------------------------------------------------------
+   旧Flowly (altair_data) からの自動移行
+   ------------------------------------------------------------ */
 function migrateLegacy(rawJson) {
   try {
     const legacy = JSON.parse(rawJson);
     if (!legacy || typeof legacy !== 'object') return null;
-    const legacyTasks = Array.isArray(legacy.tasks) ? legacy.tasks : [];
-
-    const migratedTasks = legacyTasks.map((t) => ({
-      id: t.id || (Date.now().toString(36) + Math.random().toString(36).slice(2, 6)),
-      title: t.type === 'weekly' ? `${t.title || ''}（毎週）` : (t.title || ''),
-      description: '',
-      deadline: t.deadline || null,
-      unlockDate: t.unlockDate || null,
-      // 旧Loadは0.5刻みの主観値。Temperは1〜10の整数スケール（SPEC §5）のため
-      // 単純に2倍して丸め、範囲をクランプする（データを捨てるより粗い変換を優先）。
-      load: Math.max(1, Math.min(10, Math.round((t.load || 3) * 2))),
-      done: t.type === 'weekly' ? false : !!t.done,
-      doneDate: t.doneDate || null,
-      pattern: null, // 新規に一般モデルで推定させる
-      createdAt: t.createdAt || Date.now(),
-    }));
-
-    const migrated = {
-      ...deepClone(STATE_DEFAULTS),
-      tasks: migratedTasks,
-      settings: {
-        ...STATE_DEFAULTS.settings,
-        dailyCapacity: Math.max(1, Math.min(10, Math.round(((legacy.settings && legacy.settings.capacityWeekday) || 10) / 1.6))),
-      },
-    };
+    const migrated = deepClone(STATE_DEFAULTS);
+    mergeTaskNovaLike(migrated, legacy);
     return JSON.stringify(migrated);
   } catch (e) {
     return null;
@@ -113,7 +203,231 @@ function migrateLegacy(rawJson) {
 }
 
 /* ------------------------------------------------------------
-   統計更新（SUPPLEMENT §15, §17, §23: 段階的・緩やかな適応）
+   JSONファイルからのインポート（要件: アップロードしたJSONを読み込む）
+   ------------------------------------------------------------
+   憲法10条を最優先する。インポートは常に「追加」であり、
+   既存のタスク・履歴を消さない。同じIDのタスクは重複させず飛ばす。
+   ------------------------------------------------------------ */
+
+/** JSONの中身から、どのアプリの保存データかを判定する */
+export function detectImportFormat(data) {
+  if (!data || typeof data !== 'object') return null;
+  if (data.temperVersion || (data.settings && data.settings.capacityWeekday != null && Array.isArray(data.tasks) && data.stats)) {
+    return 'temper';
+  }
+  if (Array.isArray(data.tasks) && data.settings && (data.settings.capacityWeekday != null || data.settings.capacityHoliday != null)) {
+    return 'tasknova';
+  }
+  if (Array.isArray(data.tasks)) return 'tasknova'; // Flowly/TaskEngineも同じ形
+  if (Array.isArray(data.history) && data.stats) return 'history';
+  return null;
+}
+
+/**
+ * インポート内容の要約を先に作る（実行前にユーザーへ提示するため）。
+ * @returns {{format:string, newTasks:number, duplicateTasks:number,
+ *            historyEntries:number, capacityWeekday:number|null, capacityHoliday:number|null}}
+ */
+export function summarizeImport(state, data) {
+  const format = detectImportFormat(data);
+  if (!format) return null;
+
+  const existingIds = new Set(state.tasks.map((t) => t.id));
+  const incoming = Array.isArray(data.tasks) ? data.tasks : [];
+  let newTasks = 0, duplicateTasks = 0;
+  incoming.forEach((t) => {
+    if (!t || !t.title) return;
+    if (t.id && existingIds.has(String(t.id))) duplicateTasks += 1;
+    else newTasks += 1;
+  });
+
+  const cap = readCapacities(data);
+  return {
+    format,
+    newTasks,
+    duplicateTasks,
+    historyEntries: countHistory(data),
+    capacityWeekday: cap.weekday,
+    capacityHoliday: cap.holiday,
+  };
+}
+
+function countHistory(data) {
+  if (Array.isArray(data.sessionHistory)) return data.sessionHistory.length;
+  if (Array.isArray(data.history)) return data.history.length;
+  return 0;
+}
+
+/**
+ * 旧アプリのキャパシティをTemperのスケールへ換算する。
+ * Temper形式（既にこのスケール）の場合はそのまま使う。
+ */
+function readCapacities(data) {
+  const s = data.settings || {};
+  if (data.temperVersion || s.capacityWeekday > LOAD_MAX || s.holidayWeekdays) {
+    // Temper自身の書き出し
+    return {
+      weekday: s.capacityWeekday != null ? clampInt(s.capacityWeekday, CAPACITY_MIN, CAPACITY_MAX, null) : null,
+      holiday: s.capacityHoliday != null ? clampInt(s.capacityHoliday, CAPACITY_MIN, CAPACITY_MAX, null) : null,
+    };
+  }
+  return {
+    weekday: s.capacityWeekday != null ? clampInt(s.capacityWeekday * LEGACY_LOAD_SCALE, CAPACITY_MIN, CAPACITY_MAX, null) : null,
+    holiday: s.capacityHoliday != null ? clampInt(s.capacityHoliday * LEGACY_LOAD_SCALE, CAPACITY_MIN, CAPACITY_MAX, null) : null,
+  };
+}
+
+/** TaskNOVAの学習タイプ → TemperのPattern（planner.js の PATTERNS に対応） */
+const NOVA_TYPE_TO_PATTERN = {
+  MEMORY: 'memorization',
+  LOGIC: 'problem_solving',
+  PRACTICE: 'practice',
+  READING: 'reading',
+  CREATIVE: 'writing',
+};
+
+/**
+ * データを state へ取り込む（破壊しない・追加のみ）。
+ * @returns {{addedTasks:number, skippedTasks:number, addedHistory:number, capacityApplied:boolean}}
+ */
+export function importInto(state, data) {
+  const format = detectImportFormat(data);
+  if (!format) throw new Error('対応していない形式のファイルです');
+  if (format === 'temper' || format === 'history') return mergeTemperExport(state, data);
+  return mergeTaskNovaLike(state, data);
+}
+
+function mergeTemperExport(state, data) {
+  const result = { addedTasks: 0, skippedTasks: 0, addedHistory: 0, capacityApplied: false };
+  const existingIds = new Set(state.tasks.map((t) => t.id));
+
+  (Array.isArray(data.tasks) ? data.tasks : []).forEach((t) => {
+    if (!t || !t.title) return;
+    if (t.id && existingIds.has(String(t.id))) { result.skippedTasks += 1; return; }
+    state.tasks.push({
+      id: String(t.id || newId()),
+      title: String(t.title),
+      description: typeof t.description === 'string' ? t.description : '',
+      deadline: t.deadline || null,
+      unlockDate: t.unlockDate || null,
+      load: clampInt(t.load, 1, LOAD_MAX, 4),
+      done: !!t.done,
+      doneDate: t.doneDate || null,
+      pattern: t.pattern || null,
+      createdAt: Number(t.createdAt) || Date.now(),
+    });
+    existingIds.add(String(t.id));
+    result.addedTasks += 1;
+  });
+
+  const seen = new Set(state.history.map(historyKey));
+  (Array.isArray(data.history) ? data.history : []).forEach((h) => {
+    if (!h || !h.date) return;
+    if (seen.has(historyKey(h))) return;
+    state.history.push(h);
+    seen.add(historyKey(h));
+    result.addedHistory += 1;
+  });
+
+  if (data.stats) mergeStats(state, data.stats);
+
+  const cap = readCapacities(data);
+  if (cap.weekday != null) { state.settings.capacityWeekday = cap.weekday; result.capacityApplied = true; }
+  if (cap.holiday != null) { state.settings.capacityHoliday = cap.holiday; result.capacityApplied = true; }
+  return result;
+}
+
+/**
+ * TaskNOVA / Flowly / TaskEngine 形式の取り込み。
+ * 負荷は0.5刻みの主観値なので LEGACY_LOAD_SCALE 倍して整数化する。
+ */
+function mergeTaskNovaLike(state, data) {
+  const result = { addedTasks: 0, skippedTasks: 0, addedHistory: 0, capacityApplied: false };
+  const existingIds = new Set(state.tasks.map((t) => t.id));
+
+  (Array.isArray(data.tasks) ? data.tasks : []).forEach((t) => {
+    if (!t || !t.title) return;
+    const id = String(t.id || newId());
+    if (existingIds.has(id)) { result.skippedTasks += 1; return; }
+    state.tasks.push({
+      id,
+      // 週次タスクはTemperがまだ繰り返しを一級概念として持たないため、
+      // タイトルに印を付けた単発タスクとして一度だけ取り込む
+      // （データを捨てるより、重複の可能性を許容する）。
+      title: t.type === 'weekly' ? `${t.title}（毎週）` : String(t.title),
+      description: '',
+      deadline: t.deadline || null,
+      unlockDate: t.unlockDate || null,
+      load: clampInt((Number(t.load) || 2) * LEGACY_LOAD_SCALE, 1, LOAD_MAX, 4),
+      done: t.type === 'weekly' ? false : !!t.done,
+      doneDate: t.doneDate || null,
+      pattern: null, // 取り込み後に一般モデルで推定させる
+      createdAt: Number(t.createdAt) || Date.now(),
+    });
+    existingIds.add(id);
+    result.addedTasks += 1;
+  });
+
+  // セッション履歴 → Temperのhistory
+  const seen = new Set(state.history.map(historyKey));
+  (Array.isArray(data.sessionHistory) ? data.sessionHistory : []).forEach((s) => {
+    if (!s || !s.date) return;
+    const entry = {
+      taskId: s.taskId || null,
+      event: 'completed',
+      pattern: NOVA_TYPE_TO_PATTERN[s.type] || null,
+      load: clampInt((Number(s.actualLoad) || Number(s.plannedLoad) || 1) * LEGACY_LOAD_SCALE, 1, LOAD_MAX, 2),
+      deadline: null,
+      date: s.date,
+      ts: Number(s.endAt) || Number(s.startAt) || 0,
+      source: 'tasknova',
+    };
+    if (seen.has(historyKey(entry))) return;
+    state.history.push(entry);
+    seen.add(historyKey(entry));
+    result.addedHistory += 1;
+  });
+
+  // 曜日別実績（Plannerのキャパシティ補正・曜日補正が使う）
+  const byWeekday = data.learningAnalytics && data.learningAnalytics.byWeekday;
+  if (byWeekday) mergeStats(state, { weekday: byWeekday, weekdayPattern: {} });
+
+  const cap = readCapacities(data);
+  if (cap.weekday != null) { state.settings.capacityWeekday = cap.weekday; result.capacityApplied = true; }
+  if (cap.holiday != null) { state.settings.capacityHoliday = cap.holiday; result.capacityApplied = true; }
+
+  // 休日指定の引き継ぎ
+  const s = data.settings || {};
+  if (Array.isArray(s.holidays)) {
+    s.holidays.forEach((d) => { if (typeof d === 'string') state.settings.dayTypeOverrides[d] = 'holiday'; });
+  }
+  if (s.todayOverride && s.todayOverride.date) {
+    state.settings.dayTypeOverrides[s.todayOverride.date] = s.todayOverride.isHoliday ? 'holiday' : 'weekday';
+  }
+  return result;
+}
+
+function historyKey(h) {
+  return [h.taskId || '', h.date || '', h.event || '', h.ts || ''].join('|');
+}
+
+function mergeStats(state, stats) {
+  ['weekday', 'weekdayPattern'].forEach((bucket) => {
+    const incoming = stats[bucket];
+    if (!incoming || typeof incoming !== 'object') return;
+    Object.entries(incoming).forEach(([key, v]) => {
+      if (!v || typeof v !== 'object') return;
+      const cur = state.stats[bucket][key] || { completed: 0, missed: 0 };
+      // 同じ期間を二重に足さないよう、合算ではなく「多い方」を採る。
+      cur.completed = Math.max(cur.completed, Number(v.completed) || 0);
+      cur.missed = Math.max(cur.missed, Number(v.missed) || 0);
+      state.stats[bucket][key] = cur;
+    });
+  });
+}
+
+/* ------------------------------------------------------------
+   統計更新
    ------------------------------------------------------------ */
 export function recordCompletion(state, task, completedOn) {
   const weekday = new Date(completedOn + 'T00:00:00').getDay();
@@ -129,13 +443,8 @@ export function recordCompletion(state, task, completedOn) {
   }
 
   state.history.push({
-    taskId: task.id,
-    event: 'completed',
-    pattern: task.pattern,
-    load: task.load,
-    deadline: task.deadline,
-    date: completedOn,
-    ts: Date.now(),
+    taskId: task.id, event: 'completed', pattern: task.pattern,
+    load: task.load, deadline: task.deadline, date: completedOn, ts: Date.now(),
   });
 }
 
@@ -146,21 +455,18 @@ export function recordMiss(state, task, dateStr) {
   state.stats.weekday[weekday] = wd;
 
   state.history.push({
-    taskId: task.id,
-    event: 'missed',
-    pattern: task.pattern,
-    load: task.load,
-    deadline: task.deadline,
-    date: dateStr,
-    ts: Date.now(),
+    taskId: task.id, event: 'missed', pattern: task.pattern,
+    load: task.load, deadline: task.deadline, date: dateStr, ts: Date.now(),
   });
 }
 
-/** weekdayStats/weekdayPatternStats を Planner が期待する completedRatio 形式へ変換する */
+/* ------------------------------------------------------------
+   Plannerへ渡す集計
+   ------------------------------------------------------------ */
 export function deriveWeekdayStats(state) {
   const out = {};
   Object.entries(state.stats.weekday).forEach(([wd, v]) => {
-    const total = v.completed + v.missed;
+    const total = (v.completed || 0) + (v.missed || 0);
     if (total > 0) out[wd] = { completedRatio: v.completed / total, samples: total };
   });
   return out;
@@ -169,20 +475,32 @@ export function deriveWeekdayStats(state) {
 export function deriveWeekdayPatternStats(state) {
   const out = {};
   Object.entries(state.stats.weekdayPattern).forEach(([key, v]) => {
-    const total = v.completed + v.missed;
+    const total = (v.completed || 0) + (v.missed || 0);
     if (total > 0) out[key] = { completedRatio: v.completed / total, samples: total };
   });
   return out;
 }
 
-/** Pattern個人補正用の履歴（SUPPLEMENT §6）。タイトルとPatternの組だけを渡す軽量版。 */
 export function derivePatternHistory(state) {
-  return state.tasks
-    .filter((t) => t.pattern)
-    .map((t) => ({ title: t.title, pattern: t.pattern }));
+  return state.tasks.filter((t) => t.pattern).map((t) => ({ title: t.title, pattern: t.pattern }));
 }
 
-/** 履歴のJSONエクスポート（SUPPLEMENT §26: 外部分析用、本体には分析機能を持たない） */
+/* ------------------------------------------------------------
+   書き出し
+   ------------------------------------------------------------ */
+/** 外部分析用（履歴と統計のみ） */
 export function exportHistoryJson(state) {
   return JSON.stringify({ exportedAt: new Date().toISOString(), history: state.history, stats: state.stats }, null, 2);
+}
+
+/** 復元用のフルバックアップ。importInto がそのまま読み戻せる形にする。 */
+export function exportBackupJson(state) {
+  return JSON.stringify({
+    temperVersion: 1,
+    exportedAt: new Date().toISOString(),
+    tasks: state.tasks,
+    history: state.history,
+    stats: state.stats,
+    settings: state.settings,
+  }, null, 2);
 }
