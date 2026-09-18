@@ -194,18 +194,39 @@ function weekdayPatternBonus(pattern, weekday, weekdayPatternStats) {
 
 /* ------------------------------------------------------------
    候補生成（§9）
+   ------------------------------------------------------------
+   §4「繰り返し」に対応する。単発(once)タスクは done フラグで
+   一度きりの完了を、週次(weekly)タスクは weekDays（実施する曜日の
+   集合）+ doneDates（完了した日付の集合）で「その日はもう済んだか」
+   を表す。同じタスクが翌週にはまた候補へ戻ってよいため、単発の
+   done とは別の仕組みが要る。
    ------------------------------------------------------------ */
+
+/** @returns {boolean} そのタスクが todayStr の時点で「今日はまだ済んでいない」か */
+export function isTaskPendingOn(task, todayStr) {
+  if (task.type === 'weekly') {
+    return !(Array.isArray(task.doneDates) && task.doneDates.includes(todayStr));
+  }
+  return !task.done;
+}
 
 /**
  * @param {Array} tasks 全タスク
  * @param {string} todayStr 'YYYY-MM-DD'
- * @returns {Array} 候補（解除済み・未完了のみ）
+ * @returns {Array} 候補（解除済み・その日まだ済んでいないもののみ）
  */
 export function buildCandidates(tasks, todayStr) {
+  const weekday = new Date(todayStr + 'T00:00:00').getDay();
   return tasks.filter((t) => {
-    if (t.done) return false;
     if (t.unlockDate && t.unlockDate > todayStr) return false;
-    return true;
+    if (t.type === 'weekly') {
+      if (!Array.isArray(t.weekDays) || !t.weekDays.includes(weekday)) return false;
+      // 週次タスクの期限は「その日までに1回やる」ではなく「この日以降は
+      // もう繰り返さない（シリーズの終了日）」の意味で扱う。
+      if (t.deadline && todayStr > t.deadline) return false;
+      return isTaskPendingOn(t, todayStr);
+    }
+    return isTaskPendingOn(t, todayStr);
   });
 }
 
@@ -220,6 +241,9 @@ function daysUntil(dateStr, todayStr) {
 }
 
 function deadlineSortKey(task, todayStr) {
+  // 週次タスクの期限は「シリーズの終了日」であって「今日中にやる締切」
+  // ではないため、§14の強制採用（期限超過・本日期限）の対象にしない。
+  if (task.type === 'weekly') return Infinity;
   if (!task.deadline) return Infinity; // 期限なしは最後
   return daysUntil(task.deadline, todayStr);
 }
@@ -269,7 +293,7 @@ export function buildTodayPlan({
   // 期限あり優先、期限が同じ場合はLoad降順で安定させる（§10: 追加条件による順序安定化）
   candidates.sort((a, b) => {
     if (a._daysUntil !== b._daysUntil) return a._daysUntil - b._daysUntil;
-    return (b.load || 1) - (a.load || 1);
+    return safeLoad(b.load) - safeLoad(a.load);
   });
 
   const entries = [];
@@ -286,8 +310,8 @@ export function buildTodayPlan({
   const rest = candidates.filter((t) => t._daysUntil > 0);
 
   mustInclude.forEach((t) => {
-    entries.push(toEntry(t, t._daysUntil < 0 ? 'overdue' : 'today_deadline', usedLoad + (t.load || 1) > effectiveCapacity));
-    usedLoad += (t.load || 1);
+    entries.push(toEntry(t, t._daysUntil < 0 ? 'overdue' : 'today_deadline', usedLoad + safeLoad(t.load) > effectiveCapacity));
+    usedLoad += safeLoad(t.load);
     included.add(t.id);
   });
 
@@ -319,8 +343,10 @@ export function buildTodayPlan({
   // Pattern連続・Load偏りを避ける順序へ並べ替えてから確定する（§12, §13）。
   const ordered = orderToAvoidRuns(chosenSet, lastEntryPattern());
   ordered.forEach((t) => {
-    entries.push(toEntry(t, 'filled', false));
-    usedLoad += (t.load || 1);
+    // 週次タスクは「期限が近いから」ではなく「今日がその曜日だから」
+    // 選ばれているため、詳細画面の理由もそれに合わせて区別する。
+    entries.push(toEntry(t, t.type === 'weekly' ? 'weekly' : 'filled', false));
+    usedLoad += safeLoad(t.load);
     included.add(t.id);
   });
 
@@ -355,7 +381,7 @@ function knapsackSelect(scored, capacity) {
   const dp = new Array(cap + 1).fill(null).map(() => ({ value: 0, count: 0, items: [] }));
 
   scored.forEach(({ task, value }) => {
-    const load = Math.max(1, Math.round(task.load || 1));
+    const load = safeLoad(task.load);
     for (let c = cap; c >= load; c--) {
       const prev = dp[c - load];
       const candidateValue = prev.value + value;
@@ -400,13 +426,13 @@ function orderToAvoidRuns(tasks, initialLastPattern) {
     let bestPenalty = Infinity;
     for (let i = 0; i < remaining.length; i++) {
       const t = remaining[i];
-      const penalty = patternAdjacencyPenalty(lastPattern, t._pattern) + loadRunPenaltyForValues(lastLoad, t.load || 1);
+      const penalty = patternAdjacencyPenalty(lastPattern, t._pattern) + loadRunPenaltyForValues(lastLoad, safeLoad(t.load));
       if (penalty < bestPenalty) { bestPenalty = penalty; bestIdx = i; }
     }
     const chosen = remaining.splice(bestIdx, 1)[0];
     ordered.push(chosen);
     lastPattern = chosen._pattern;
-    lastLoad = chosen.load || 1;
+    lastLoad = safeLoad(chosen.load);
   }
   return ordered;
 }
@@ -418,13 +444,34 @@ function loadRunPenaltyForValues(lastLoad, incomingLoad) {
   return 0;
 }
 
+/**
+ * タスクのload値を安全な整数(1以上)に丸める。
+ * ------------------------------------------------------------
+ * 本来はstore.js側のnormalizeTask()でload(1〜10)にクランプ済みの
+ * データしか流れてこない想定だが、Plannerは「taskStore由来のプレーン
+ * オブジェクト配列を受け取る」（ヘッダコメント）としか契約しておらず、
+ * 壊れたローカルストレージ等で不正な値（負・0・NaN・undefined）が
+ * 来てもクラッシュしたり負のloadが表示に漏れたりしないよう、ここで
+ * 一箇所に統一して防御する。
+ *
+ * 以前は個々の参照箇所で `task.load || 1` という書き方をしていたが、
+ * この書き方は「falsyな値（0/null/undefined/NaN）」しか1に置き換え
+ * ないため、**負の値（例: -3）はそのまま素通りする**バグがあった
+ * （シミュレーション検証で発見: 壊れたloadを持つタスクのentryに
+ * 負のloadが表示され、今日の負荷合計が実際より少なく計算されていた）。
+ */
+function safeLoad(rawLoad) {
+  const n = Math.round(Number(rawLoad));
+  return Number.isFinite(n) && n >= 1 ? n : 1;
+}
+
 function toEntry(task, src, overCapacity) {
   return {
     id: task.id,
-    load: task.load || 1,
+    load: safeLoad(task.load),
     pattern: task._pattern,
     deadline: task.deadline || null,
-    src, // 'overdue' | 'today_deadline' | 'filled'
+    src, // 'overdue' | 'today_deadline' | 'weekly' | 'filled'
     overCapacity: !!overCapacity,
   };
 }
@@ -440,6 +487,7 @@ export function explainSelection(entry) {
   const parts = [];
   if (entry.src === 'overdue') parts.push('期限を過ぎているため');
   else if (entry.src === 'today_deadline') parts.push('今日が期限のため');
+  else if (entry.src === 'weekly') parts.push('毎週この曜日に行うため');
   else if (entry.deadline) parts.push('期限が近いため');
   else parts.push('学習内容の偏りを避けるため');
   if (entry.overCapacity) parts.push('容量を超えても今日中に扱う必要があるため');

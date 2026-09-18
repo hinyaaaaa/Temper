@@ -147,21 +147,36 @@ function renderTodayPage() {
   if (!currentTodayPlan) recomputeTodayPlan();
   const plan = currentTodayPlan;
 
-  const pendingEntries = plan.entries.filter((e) => !isTaskDone(e.id));
-  const doneLoad = plan.entries.filter((e) => isTaskDone(e.id)).reduce((sum, e) => sum + e.load, 0);
+  // plan.entries は buildCandidates の時点で「今日まだ済んでいないもの」
+  // しか含まない（済んだタスクは候補から外れる）。そのため今日の
+  // 消化分(doneLoad)は plan からではなく、state.tasks を直接見て
+  // 「今日という日付に完了したか」で数える。こうしておけば、容量変更
+  // などで plan が再計算されても、既に完了したタスクの負荷値が
+  // 消えてしまうことがない（plan.entries に残っているかどうかに
+  // 依存しないため）。
+  const pendingEntries = plan.entries.filter((e) => !isTaskDoneToday(e.id, today));
+  const doneLoad = state.tasks
+    .filter((t) => Store.isTaskDoneToday(t, today))
+    .reduce((sum, t) => sum + (t.load || 0), 0);
+  // plan.totalLoad は「完了前に選ばれた時点」の合計なので、完了後も
+  // そのまま使うと doneLoad と二重に数えてしまう（完了させても
+  // recomputeTodayPlan() を呼ばないため、plan.entries に完了済みの
+  // タスクがまだ残っている）。pendingEntries（未完了のみ）から
+  // 合計し直すことで二重計上を避ける。
+  const pendingLoad = pendingEntries.reduce((sum, e) => sum + e.load, 0);
+  const totalLoad = doneLoad + pendingLoad;
   const capacity = plan.effectiveCapacity;
 
   const C = 2 * Math.PI * 23;
   const frac = (v) => (capacity > 0 ? Math.min(1, v / capacity) : 0);
-  const plannedOffset = C * (1 - frac(plan.totalLoad));
+  const plannedOffset = C * (1 - frac(totalLoad));
   const doneOffset = C * (1 - frac(doneLoad));
 
   const timeOfDay = Weather.getTimeOfDay();
   const condition = weatherState ? weatherState.condition : 'clear';
-  const dayType = Store.getDayType(state, today);
 
   let taskListHtml;
-  if (!plan.entries.length) {
+  if (!plan.entries.length && doneLoad === 0) {
     taskListHtml = `<div class="empty-state glass card"><div class="glyph">✧</div><div class="msg">今日扱うタスクはありません</div></div>`;
   } else if (!pendingEntries.length) {
     taskListHtml = `<div class="empty-state glass card"><div class="glyph">✧</div><div class="msg">今日の分はすべて終えました</div></div>`;
@@ -179,19 +194,12 @@ function renderTodayPage() {
       <div class="progress-main">
         <svg class="load-ring-svg" viewBox="0 0 54 54" aria-hidden="true">
           <circle class="load-ring-track" cx="27" cy="27" r="23"/>
-          ${plan.totalLoad > 0 ? `<circle class="load-ring-planned" cx="27" cy="27" r="23" stroke-dasharray="${C}" stroke-dashoffset="${plannedOffset}" transform="rotate(-90 27 27)"/>` : ''}
+          ${totalLoad > 0 ? `<circle class="load-ring-planned" cx="27" cy="27" r="23" stroke-dasharray="${C}" stroke-dashoffset="${plannedOffset}" transform="rotate(-90 27 27)"/>` : ''}
           ${doneLoad > 0 ? `<circle class="load-ring-done" cx="27" cy="27" r="23" stroke-dasharray="${C}" stroke-dashoffset="${doneOffset}" transform="rotate(-90 27 27)"/>` : ''}
         </svg>
         <div class="progress-text">
-          <div class="progress-value">今日の負荷　<b>${plan.totalLoad}</b> / ${capacity}</div>
+          <div class="progress-value">今日の負荷　<b>${totalLoad}</b> / ${capacity}</div>
           <div class="progress-sub">${pendingEntries.length}件が残っています${doneLoad > 0 ? `　（消化 ${doneLoad}）` : ''}</div>
-        </div>
-      </div>
-      <div class="segmented-row">
-        <span class="segmented-caption">今日の扱い</span>
-        <div class="segmented" role="group" aria-label="今日を平日として扱うか休日として扱うか">
-          <button class="${dayType === 'weekday' ? 'active' : ''}" onclick="Temper.setTodayType('weekday')">平日</button>
-          <button class="${dayType === 'holiday' ? 'active' : ''}" onclick="Temper.setTodayType('holiday')">休日</button>
         </div>
       </div>
     </div>
@@ -201,12 +209,20 @@ function renderTodayPage() {
   `;
 }
 
-function isTaskDone(taskId) {
+/** 「今日」という日付の時点で済んでいるか（plan.entriesに依存しない） */
+function isTaskDoneToday(taskId, dateStr) {
   const t = state.tasks.find((x) => x.id === taskId);
-  return !!(t && t.done);
+  return !!t && Store.isTaskDoneToday(t, dateStr || todayStr());
 }
 
-/** 平日 / 休日の手動切り替え（容量が変わるので即座に再選定する） */
+/**
+ * 平日 / 休日の手動切り替え。
+ * ------------------------------------------------------------
+ * 要件: 通常はシステムが曜日から自動判定し、手動切替は設定タブにだけ
+ * 置く（今日タブには置かない）。世間は平日でも個人的には休日、と
+ * いった食い違いがありうるため、切替そのものは残しつつ置き場所を
+ * 設定タブに限定する。
+ */
 function setTodayType(dayType) {
   const today = todayStr();
   if (Store.getDayType(state, today) === dayType) return;
@@ -223,12 +239,24 @@ function setTodayType(dayType) {
 function renderTaskCard(entryOrTask, opts = {}) {
   const t = state.tasks.find((x) => x.id === entryOrTask.id);
   if (!t) return '';
+  const today = todayStr();
+  // チェックボックスの表示は「完了しているか」（isTaskComplete）で判定する。
+  // 「今日完了したか」（isTaskDoneToday）ではない — 単発タスクは完了日に
+  // 関わらずずっと完了のままなので、過去の日に完了したタスクが完了済み
+  // タブで未チェックに見えてしまわないようにするため（toggleTaskの
+  // 判定と揃える必要がある。ズレると取り消しのつもりの操作が「今日
+  // 改めて完了」扱いになり、履歴が余分に積まれる）。
+  const doneToday = Store.isTaskComplete(t, today);
+
   const chips = [];
-  if (t.deadline) {
+  if (t.type === 'weekly') {
+    const label = Store.weekDaysLabel(t.weekDays);
+    if (label) chips.push(`<span class="task-meta-chip">毎週${label}</span>`);
+  } else if (t.deadline) {
     const days = daysUntilFromToday(t.deadline);
     chips.push(`<span class="task-meta-chip${days <= 1 ? ' urgent' : ''}">${deadlineLabel(days)}</span>`);
   }
-  if (t.unlockDate && t.unlockDate > todayStr()) {
+  if (t.unlockDate && t.unlockDate > today) {
     chips.push(`<span class="task-meta-chip">${formatDateLabel(t.unlockDate)}から</span>`);
   }
   // 負荷は数字と点の並びの両方で読めるようにする（SPEC §5 / 憲法12条）。
@@ -246,10 +274,10 @@ function renderTaskCard(entryOrTask, opts = {}) {
       </div>` : '';
 
   return `
-    <div class="task-card glass${t.done ? ' done' : ''}" data-task-id="${t.id}"
+    <div class="task-card glass${doneToday ? ' done' : ''}" data-task-id="${t.id}"
          ontouchstart="Temper.onCardPressStart('${t.id}')" ontouchend="Temper.onCardPressEnd()" ontouchmove="Temper.onCardPressEnd()"
          onmousedown="Temper.onCardPressStart('${t.id}')" onmouseup="Temper.onCardPressEnd()" onmouseleave="Temper.onCardPressEnd()">
-      <button class="task-check${t.done ? ' checked' : ''}" onclick="event.stopPropagation();Temper.toggleTask('${t.id}')" aria-label="${t.done ? '未完了に戻す' : '完了にする'}">
+      <button class="task-check${doneToday ? ' checked' : ''}" onclick="event.stopPropagation();Temper.toggleTask('${t.id}')" aria-label="${doneToday ? '未完了に戻す' : '完了にする'}">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20,6 9,17 4,12"/></svg>
       </button>
       <div class="task-main">
@@ -283,14 +311,18 @@ function openDetailSheet(taskId) {
   if (!t) return;
   const entry = currentTodayPlan && currentTodayPlan.entries.find((e) => e.id === taskId);
   const reason = entry ? Planner.explainSelection(entry) : null;
+  const weekly = t.type === 'weekly';
+  const doneToday = Store.isTaskComplete(t, todayStr());
 
   document.getElementById('detail-sheet-body').innerHTML = `
     <div class="sheet-grabber"></div>
     <div class="sheet-title">${esc(t.title)}</div>
-    <div class="sheet-row"><span class="sheet-row-label">期限</span><span>${t.deadline ? formatDateLabel(t.deadline) : 'なし'}</span></div>
+    ${weekly
+      ? `<div class="sheet-row"><span class="sheet-row-label">曜日</span><span>毎週${esc(Store.weekDaysLabel(t.weekDays) || '未設定')}</span></div>`
+      : `<div class="sheet-row"><span class="sheet-row-label">期限</span><span>${t.deadline ? formatDateLabel(t.deadline) : 'なし'}</span></div>`}
     <div class="sheet-row"><span class="sheet-row-label">解禁日</span><span>${t.unlockDate ? formatDateLabel(t.unlockDate) : 'なし'}</span></div>
     <div class="sheet-row"><span class="sheet-row-label">負荷</span><span>${t.load} / 10</span></div>
-    <div class="sheet-row"><span class="sheet-row-label">状態</span><span>${t.done ? '完了' : '未完了'}</span></div>
+    <div class="sheet-row"><span class="sheet-row-label">状態</span><span>${doneToday ? (weekly ? '今日は完了' : '完了') : '未完了'}</span></div>
     ${reason ? `<div class="sheet-note">今日選ばれた理由：${esc(reason)}</div>` : ''}
     <div class="sheet-actions">
       <button class="btn btn-secondary" onclick="Temper.closeDetailSheet()">閉じる</button>
@@ -303,14 +335,39 @@ function closeDetailSheet() { document.getElementById('detail-sheet').classList.
 
 /* ------------------------------------------------------------
    完了 / 取り消し（SPEC §10: 演出をせず静かに状態が変わる）
+   ------------------------------------------------------------
+   単発(once): done/doneDate で一度きりの完了を表す。
+   週次(weekly): doneDates に「完了した日付」を足し引きする。
+   同じタスクが翌週にはまた候補へ戻るのは、その日付が
+   doneDates に無いから、というだけの単純な仕組みにしてある。
+
+   取り消し時はStore.undoCompletion()でhistory/統計の加算も
+   打ち消す。これを怠ると、完了→取り消し→再完了を繰り返すたびに
+   historyへエントリが積み重なってしまう。
    ------------------------------------------------------------ */
 function toggleTask(taskId) {
   const t = state.tasks.find((x) => x.id === taskId);
   if (!t) return;
+  const today = todayStr();
+  // 「今完了しているか」は isTaskComplete（完了日に関わらない永続状態）
+  // で判定する。isTaskDoneToday（今日完了したかどうか）で判定すると、
+  // 過去の日に完了した単発タスクをここで取り消そうとした際に「今日は
+  // まだ完了していない」と誤判定され、取り消しではなく「今日改めて
+  // 完了」扱いになって doneDate が上書きされ、履歴も余分に積まれる。
+  const doneNow = Store.isTaskComplete(t, today);
 
-  if (t.done) {
-    t.done = false;
-    t.doneDate = null;
+  if (doneNow) {
+    // 取り消し: 単発タスクは元の完了日（doneDate）を使って対応する
+    // history/統計を打ち消す。既にリセットした後では日付が失われるため、
+    // 先に読み取っておく。
+    const completionDate = t.type === 'weekly' ? today : (t.doneDate || today);
+    if (t.type === 'weekly') {
+      t.doneDates = (t.doneDates || []).filter((d) => d !== today);
+    } else {
+      t.done = false;
+      t.doneDate = null;
+    }
+    Store.undoCompletion(state, t, completionDate);
     persist();
     recomputeTodayPlan();
     render();
@@ -320,9 +377,14 @@ function toggleTask(taskId) {
   const cardEl = document.querySelector(`.task-card[data-task-id="${taskId}"]`);
   if (cardEl && currentPage === 'today') cardEl.classList.add('completing');
   const finish = () => {
-    t.done = true;
-    t.doneDate = todayStr();
-    Store.recordCompletion(state, t, todayStr());
+    if (t.type === 'weekly') {
+      t.doneDates = t.doneDates || [];
+      if (!t.doneDates.includes(today)) t.doneDates.push(today);
+    } else {
+      t.done = true;
+      t.doneDate = today;
+    }
+    Store.recordCompletion(state, t, today);
     persist();
     render();
   };
@@ -332,12 +394,30 @@ function toggleTask(taskId) {
 
 /* ------------------------------------------------------------
    タスク一覧画面
+   ------------------------------------------------------------
+   週次タスクは終わりのないシリーズなので「完了済み」に移ることが
+   ない（SPEC §12: タスクが存在することと今日選択されることは別概念、
+   の延長として、タスク自体の存在と個々の日の完了も別概念として扱う）。
+   常に「未完了」側に数える。
    ------------------------------------------------------------ */
 let taskFilter = 'active';
+let taskSort = 'deadline'; // 'deadline' | 'load'
+
+function sortTasksForList(list) {
+  const arr = list.slice();
+  if (taskSort === 'load') {
+    arr.sort((a, b) => (b.load || 0) - (a.load || 0));
+  } else {
+    const key = (t) => (t.type !== 'weekly' && t.deadline) ? daysUntilFromToday(t.deadline) : Infinity;
+    arr.sort((a, b) => key(a) - key(b));
+  }
+  return arr;
+}
+
 function renderTasksPage() {
-  const active = state.tasks.filter((t) => !t.done);
-  const done = state.tasks.filter((t) => t.done);
-  const list = taskFilter === 'active' ? active : done;
+  const active = state.tasks.filter((t) => t.type === 'weekly' || !t.done);
+  const done = state.tasks.filter((t) => t.type !== 'weekly' && t.done);
+  const list = sortTasksForList(taskFilter === 'active' ? active : done);
 
   const listHtml = list.length
     ? list.map((t) => renderTaskCard(t, { withActions: true })).join('')
@@ -347,15 +427,20 @@ function renderTasksPage() {
     <div class="page-head">
       <div class="page-title">タスク</div>
     </div>
-    <div class="segmented" style="margin:0 0 var(--sp-3)">
+    <div class="segmented" style="margin:0 0 8px">
       <button class="${taskFilter === 'active' ? 'active' : ''}" onclick="Temper.setTaskFilter('active')">未完了 ${active.length}</button>
       <button class="${taskFilter === 'done' ? 'active' : ''}" onclick="Temper.setTaskFilter('done')">完了済み ${done.length}</button>
+    </div>
+    <div class="segmented" style="margin:0 0 var(--sp-3)">
+      <button class="${taskSort === 'deadline' ? 'active' : ''}" onclick="Temper.setTaskSort('deadline')">期限順</button>
+      <button class="${taskSort === 'load' ? 'active' : ''}" onclick="Temper.setTaskSort('load')">負荷順</button>
     </div>
     <div>${listHtml}</div>
   `;
 }
 
 function setTaskFilter(f) { taskFilter = f; render(); }
+function setTaskSort(s) { taskSort = s; render(); }
 
 /** 削除は取り消せないため必ず確認を挟む（憲法16条: データの安全性が最優先） */
 function deleteTask(taskId) {
@@ -377,8 +462,12 @@ function deleteTask(taskId) {
 }
 
 /* ------------------------------------------------------------
-   タスク追加 / 編集（SPEC §13: タイトル・期限・解禁日・負荷の4項目）
+   タスク追加 / 編集（SPEC §13: タイトル・期限・解禁日・負荷の4項目
+   + §4「繰り返し」に対応する種別・曜日）
    ------------------------------------------------------------ */
+let modalTaskType = 'once';
+let modalWeekDays = new Set();
+
 function openAddTask() {
   editingTaskId = null;
   document.getElementById('modal-task-title').textContent = 'タスクを追加';
@@ -386,6 +475,8 @@ function openAddTask() {
   document.getElementById('input-deadline').value = '';
   document.getElementById('input-unlock').value = '';
   setLoadSlider(4);
+  modalWeekDays = new Set();
+  setTaskType('once');
   openOverlay('modal-task');
 }
 
@@ -398,7 +489,33 @@ function openEditTask(taskId) {
   document.getElementById('input-deadline').value = t.deadline || '';
   document.getElementById('input-unlock').value = t.unlockDate || '';
   setLoadSlider(t.load || 4);
+  modalWeekDays = new Set(Array.isArray(t.weekDays) ? t.weekDays : []);
+  setTaskType(t.type === 'weekly' ? 'weekly' : 'once');
   openOverlay('modal-task');
+}
+
+/** 種別（単発/毎週）の切り替え。曜日ピッカーの表示と期限ラベルを合わせる。 */
+function setTaskType(type) {
+  modalTaskType = type;
+  document.querySelectorAll('#task-type-segmented button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.type === type);
+  });
+  document.getElementById('field-weekdays').style.display = type === 'weekly' ? '' : 'none';
+  // 週次タスクの「期限」は毎回の締切ではなく、シリーズを終える日という
+  // 意味になるため、ラベルだけ変えて誤解を防ぐ（項目自体は増やさない）。
+  document.getElementById('input-deadline-label').textContent = type === 'weekly' ? '終了日（任意）' : '期限';
+  syncWeekdayPickerUI();
+}
+
+function toggleModalWeekDay(day) {
+  if (modalWeekDays.has(day)) modalWeekDays.delete(day);
+  else modalWeekDays.add(day);
+  syncWeekdayPickerUI();
+}
+function syncWeekdayPickerUI() {
+  document.querySelectorAll('#weekday-picker button').forEach((b) => {
+    b.classList.toggle('active', modalWeekDays.has(Number(b.dataset.day)));
+  });
 }
 
 function setLoadSlider(v) {
@@ -420,20 +537,39 @@ function clearDateField(id) { document.getElementById(id).value = ''; }
 function saveTaskFromModal() {
   const title = document.getElementById('input-title').value.trim();
   if (!title) { showToast('タイトルを入力してください'); return; }
+  if (modalTaskType === 'weekly' && modalWeekDays.size === 0) {
+    showToast('曜日を選んでください');
+    return;
+  }
   const deadline = document.getElementById('input-deadline').value || null;
   const unlockDate = document.getElementById('input-unlock').value || null;
   const load = parseInt(document.getElementById('input-load').value, 10) || 4;
+  const weekDays = [...modalWeekDays].sort();
 
   if (editingTaskId) {
     const t = state.tasks.find((x) => x.id === editingTaskId);
     if (t) {
+      const typeChanged = (t.type || 'once') !== modalTaskType;
       t.title = title; t.deadline = deadline; t.unlockDate = unlockDate; t.load = load;
+      t.type = modalTaskType;
+      t.weekDays = modalTaskType === 'weekly' ? weekDays : [];
+      if (typeChanged) {
+        // 単発↔毎週を切り替えた場合のみ、古い完了記録を持ち越さない
+        // （単発のdone/doneDateと週次のdoneDatesは意味が違うため）。
+        // ただの編集（種別は変えていない）で完了状態を消してしまわないよう、
+        // 変わっていないときはtouchしない。
+        t.doneDates = [];
+        t.done = false; t.doneDate = null;
+      }
       t.pattern = Planner.estimatePattern(title, t.description, Store.derivePatternHistory(state));
     }
   } else {
     state.tasks.push({
       id: Store.newId(),
       title, description: '', deadline, unlockDate, load,
+      type: modalTaskType,
+      weekDays: modalTaskType === 'weekly' ? weekDays : [],
+      doneDates: [],
       done: false, doneDate: null,
       pattern: Planner.estimatePattern(title, '', Store.derivePatternHistory(state)),
       createdAt: Date.now(),
@@ -480,7 +616,7 @@ function renderSettingsPage() {
     </div>
 
     <div class="card glass">
-      <div class="section-label" style="padding-left:0">1日の負荷キャパシティ</div>
+      <div class="section-label" style="padding-left:0">負荷キャパシティ</div>
       <div class="settings-stack">
         <div>
           <div class="field-head"><span class="field-label">平日</span></div>
@@ -503,27 +639,22 @@ function renderSettingsPage() {
       </div>
       <div class="settings-divider"></div>
       <div class="segmented-row">
-        <span class="segmented-caption">今日の扱い</span>
+        <span class="segmented-caption">今日は</span>
         <div class="segmented">
           <button class="${dayType === 'weekday' ? 'active' : ''}" onclick="Temper.setTodayType('weekday')">平日</button>
           <button class="${dayType === 'holiday' ? 'active' : ''}" onclick="Temper.setTodayType('holiday')">休日</button>
         </div>
       </div>
-      <div class="settings-desc">${formatDateLabel(today)}は「${dayType === 'holiday' ? '休日' : '平日'}」として計算しています。土日は既定で休日です。</div>
     </div>
 
     <div class="card glass">
       <div class="settings-row">
-        <div>
-          <div class="settings-row-title">位置情報から天気を取得</div>
-          <div class="settings-desc">オフにすると常に晴れとして表示します</div>
-        </div>
+        <div class="settings-row-title">天気を自動取得</div>
         <button class="toggle ${s.weatherAutoLocation ? 'on' : ''}" role="switch" aria-checked="${s.weatherAutoLocation}" onclick="Temper.toggleWeatherAuto()"></button>
       </div>
     </div>
 
     <div class="card glass">
-      <div class="section-label" style="padding-left:0">データ</div>
       <div class="settings-stack">
         <button class="btn btn-primary btn-full" onclick="Temper.pickImportFile()">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="M7 8l5-5 5 5"/><path d="M4 15v4a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg>
@@ -531,16 +662,6 @@ function renderSettingsPage() {
         </button>
         <button class="btn btn-secondary btn-full" onclick="Temper.exportBackup()">バックアップを書き出す</button>
         <button class="btn btn-secondary btn-full" onclick="Temper.exportHistory()">学習履歴を書き出す</button>
-      </div>
-      <div class="settings-desc">読み込みは追加のみで、今あるタスクや履歴を消しません。TaskNOVA・Flowly・Temperの保存データに対応します。</div>
-    </div>
-
-    <div class="card glass">
-      <div class="settings-row">
-        <div>
-          <div class="settings-row-title">登録済みのタスク</div>
-          <div class="settings-desc">未完了 ${state.tasks.filter((t) => !t.done).length}件　完了 ${state.tasks.filter((t) => t.done).length}件　履歴 ${state.history.length}件</div>
-        </div>
       </div>
     </div>
   `;
@@ -866,9 +987,9 @@ function init() {
 
 window.Temper = {
   navigateTo, toggleTask, onCardPressStart, onCardPressEnd,
-  openDetailSheet, closeDetailSheet, setTaskFilter, setTodayType,
+  openDetailSheet, closeDetailSheet, setTaskFilter, setTaskSort, setTodayType,
   openAddTask, openEditTask, deleteTask, saveTaskFromModal, closeTaskModal,
-  onLoadSliderInput, stepLoad, clearDateField,
+  onLoadSliderInput, stepLoad, clearDateField, setTaskType, toggleModalWeekDay,
   onCapacityInput, stepCapacity, toggleWeatherAuto,
   pickImportFile, exportHistory, exportBackup,
 };

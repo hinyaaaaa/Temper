@@ -116,20 +116,55 @@ export function normalizeState(state) {
   if (!state.stats.weekday) state.stats.weekday = {};
   if (!state.stats.weekdayPattern) state.stats.weekdayPattern = {};
 
-  state.tasks = state.tasks.filter((t) => t && typeof t === 'object').map((t) => ({
+  state.tasks = state.tasks.filter((t) => t && typeof t === 'object').map(normalizeTask);
+
+  return state;
+}
+
+/**
+ * 1タスク分の形を揃える。type='weekly'（§4「繰り返し」）のときだけ
+ * weekDays/doneDates が意味を持つ。'once' のときは従来通り done/doneDate。
+ */
+function normalizeTask(t) {
+  const type = t.type === 'weekly' ? 'weekly' : 'once';
+  return {
     id: String(t.id || newId()),
     title: String(t.title || ''),
     description: typeof t.description === 'string' ? t.description : '',
     deadline: t.deadline || null,
     unlockDate: t.unlockDate || null,
     load: clampInt(t.load, 1, LOAD_MAX, 4),
-    done: !!t.done,
-    doneDate: t.doneDate || null,
+    type,
+    // 実施する曜日(0=日〜6=土)。weeklyのみ使う。
+    weekDays: type === 'weekly' && Array.isArray(t.weekDays)
+      ? [...new Set(t.weekDays.map((n) => Number(n)).filter((n) => Number.isInteger(n) && n >= 0 && n <= 6))].sort()
+      : [],
+    // 完了した日付('YYYY-MM-DD')の集合。weeklyのみ使う。
+    doneDates: type === 'weekly' && Array.isArray(t.doneDates)
+      ? [...new Set(t.doneDates.filter((d) => typeof d === 'string'))]
+      : [],
+    done: type === 'weekly' ? false : !!t.done,
+    doneDate: type === 'weekly' ? null : (t.doneDate || null),
     pattern: t.pattern || null,
     createdAt: Number(t.createdAt) || Date.now(),
-  }));
+  };
+}
 
-  return state;
+/**
+ * そのタスクが指定日に「もう済んでいる」か。
+ * once: done && doneDate===dateStr（＝その日に完了した）
+ * weekly: doneDatesにその日が含まれるか
+ */
+export function isTaskDoneToday(task, dateStr) {
+  if (task.type === 'weekly') return Array.isArray(task.doneDates) && task.doneDates.includes(dateStr);
+  return !!task.done && task.doneDate === dateStr;
+}
+
+const WEEKDAY_LABELS = ['日', '月', '火', '水', '木', '金', '土'];
+/** [1,3,5] → '月・水・金'（設定不要ならnull） */
+export function weekDaysLabel(weekDays) {
+  if (!Array.isArray(weekDays) || !weekDays.length) return null;
+  return weekDays.slice().sort().map((d) => WEEKDAY_LABELS[d]).join('・');
 }
 
 export function newId() {
@@ -304,18 +339,7 @@ function mergeTemperExport(state, data) {
   (Array.isArray(data.tasks) ? data.tasks : []).forEach((t) => {
     if (!t || !t.title) return;
     if (t.id && existingIds.has(String(t.id))) { result.skippedTasks += 1; return; }
-    state.tasks.push({
-      id: String(t.id || newId()),
-      title: String(t.title),
-      description: typeof t.description === 'string' ? t.description : '',
-      deadline: t.deadline || null,
-      unlockDate: t.unlockDate || null,
-      load: clampInt(t.load, 1, LOAD_MAX, 4),
-      done: !!t.done,
-      doneDate: t.doneDate || null,
-      pattern: t.pattern || null,
-      createdAt: Number(t.createdAt) || Date.now(),
-    });
+    state.tasks.push(normalizeTask(t));
     existingIds.add(String(t.id));
     result.addedTasks += 1;
   });
@@ -340,6 +364,10 @@ function mergeTemperExport(state, data) {
 /**
  * TaskNOVA / Flowly / TaskEngine 形式の取り込み。
  * 負荷は0.5刻みの主観値なので LEGACY_LOAD_SCALE 倍して整数化する。
+ * 週次タスク(type:'weekly', weekDays[])はTemperも同じ概念を持つため、
+ * そのまま週次タスクとして取り込む（旧版は「タイトルに（毎週）を付けた
+ * 単発タスク」として一度だけ複製する簡易対応だったが、週次を本実装した
+ * ことでこの回避策は不要になった）。
  */
 function mergeTaskNovaLike(state, data) {
   const result = { addedTasks: 0, skippedTasks: 0, addedHistory: 0, capacityApplied: false };
@@ -349,21 +377,21 @@ function mergeTaskNovaLike(state, data) {
     if (!t || !t.title) return;
     const id = String(t.id || newId());
     if (existingIds.has(id)) { result.skippedTasks += 1; return; }
-    state.tasks.push({
+    state.tasks.push(normalizeTask({
       id,
-      // 週次タスクはTemperがまだ繰り返しを一級概念として持たないため、
-      // タイトルに印を付けた単発タスクとして一度だけ取り込む
-      // （データを捨てるより、重複の可能性を許容する）。
-      title: t.type === 'weekly' ? `${t.title}（毎週）` : String(t.title),
+      title: String(t.title),
       description: '',
       deadline: t.deadline || null,
       unlockDate: t.unlockDate || null,
-      load: clampInt((Number(t.load) || 2) * LEGACY_LOAD_SCALE, 1, LOAD_MAX, 4),
-      done: t.type === 'weekly' ? false : !!t.done,
+      load: (Number(t.load) || 2) * LEGACY_LOAD_SCALE,
+      type: t.type === 'weekly' ? 'weekly' : 'once',
+      weekDays: t.weekDays,
+      doneDates: [],
+      done: !!t.done,
       doneDate: t.doneDate || null,
       pattern: null, // 取り込み後に一般モデルで推定させる
       createdAt: Number(t.createdAt) || Date.now(),
-    });
+    }));
     existingIds.add(id);
     result.addedTasks += 1;
   });
@@ -426,6 +454,23 @@ function mergeStats(state, stats) {
   });
 }
 
+/**
+ * そのタスクが「完了状態」かどうか（チェックボックスの表示・トグル操作
+ * で「これから完了にするのか、取り消すのか」を判定するために使う）。
+ * ------------------------------------------------------------
+ * isTaskDoneToday() とは意味が異なる。単発タスクは一度完了すれば
+ * 完了日に関わらずずっと「完了」のままだが、今日の負荷集計
+ * （isTaskDoneToday）は「今日完了したものだけ」を数えたい。
+ * この区別を怠ると、過去の日に完了した単発タスクの完了済みタブで
+ * チェックを外そうとしたときに「今日はまだ完了していない」と誤判定され、
+ * 取り消しではなく「今日改めて完了」扱いになって doneDate が今日に
+ * 上書きされ、履歴にもう1件積み増されてしまう。
+ */
+export function isTaskComplete(task, todayStr) {
+  if (task.type === 'weekly') return Array.isArray(task.doneDates) && task.doneDates.includes(todayStr);
+  return !!task.done;
+}
+
 /* ------------------------------------------------------------
    統計更新
    ------------------------------------------------------------ */
@@ -446,6 +491,40 @@ export function recordCompletion(state, task, completedOn) {
     taskId: task.id, event: 'completed', pattern: task.pattern,
     load: task.load, deadline: task.deadline, date: completedOn, ts: Date.now(),
   });
+}
+
+/**
+ * recordCompletion() の取り消し。完了のチェックを外したときに呼ぶ。
+ * ------------------------------------------------------------
+ * これを呼ばずに済フラグだけ戻すと、「完了→取り消し→再完了」を
+ * 繰り返すたびに history へエントリが積み重なり、曜日別の統計
+ * （stats.weekday の completed 件数）も実際より多く完了したかの
+ * ように狂っていく。対応するhistoryエントリ（taskId・date・
+ * event='completed' が一致する直近の1件）を1件だけ削除し、統計の
+ * 加算も同じ分だけ打ち消す。
+ *
+ * 「1件だけ」削除するのは、同じタスクが別の日に完了した記録まで
+ * 誤って消さないため（同日中の完了→取り消しは通常1回分のはず
+ * だが、念のため後ろから探して直近の1件のみ対象にする）。
+ */
+export function undoCompletion(state, task, completedOn) {
+  for (let i = state.history.length - 1; i >= 0; i--) {
+    const h = state.history[i];
+    if (h.taskId === task.id && h.date === completedOn && h.event === 'completed') {
+      state.history.splice(i, 1);
+      break;
+    }
+  }
+
+  const weekday = new Date(completedOn + 'T00:00:00').getDay();
+  const wd = state.stats.weekday[weekday];
+  if (wd && wd.completed > 0) wd.completed -= 1;
+
+  if (task.pattern) {
+    const key = `${weekday}:${task.pattern}`;
+    const wp = state.stats.weekdayPattern[key];
+    if (wp && wp.completed > 0) wp.completed -= 1;
+  }
 }
 
 export function recordMiss(state, task, dateStr) {
