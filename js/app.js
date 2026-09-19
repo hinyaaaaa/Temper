@@ -21,6 +21,9 @@ let editingTaskId = null;
 let weatherState = null;   // { condition, temperature, source } | null（取得失敗時）
 let pendingImport = null;  // インポート確認中のデータ
 
+/** 設定タブに小さく表示するだけの表示用バージョン。改修のたびに上げる。 */
+const APP_VERSION = 'v1.6.0';
+
 const todayStr = () => {
   const d = new Date();
   return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
@@ -217,7 +220,7 @@ function renderTodayPage() {
 
   const timeOfDay = Weather.getTimeOfDay();
   const condition = weatherState ? weatherState.condition : 'clear';
-  const finishLabel = estimateFinishLabel(pendingLoad);
+  const finishLabel = estimateAllTasksFinishLabel(today, doneLoad);
 
   let taskListHtml;
   if (!plan.entries.length && doneLoad === 0) {
@@ -242,9 +245,9 @@ function renderTodayPage() {
           ${doneLoad > 0 ? `<circle class="load-ring-done" cx="27" cy="27" r="23" stroke-dasharray="${C}" stroke-dashoffset="${doneOffset}" transform="rotate(-90 27 27)"/>` : ''}
         </svg>
         <div class="progress-text">
-          <div class="progress-value">今日の負荷　<b>${totalLoad}</b> / ${capacity}</div>
+          <div class="progress-value">今日の負荷　<b>${pendingLoad}</b> / ${capacity}</div>
           <div class="progress-sub">${pendingEntries.length}件が残っています${doneLoad > 0 ? `　（消化 ${doneLoad}）` : ''}</div>
-          ${finishLabel ? `<div class="progress-finish">終了目安 ${finishLabel}</div>` : ''}
+          ${finishLabel ? `<div class="progress-finish">全タスク完了目安 ${finishLabel}</div>` : ''}
         </div>
       </div>
     </div>
@@ -255,17 +258,27 @@ function renderTodayPage() {
 }
 
 /**
- * 残りの負荷から、終了目安の時刻を概算する（小さく添える程度の目安）。
+ * 「終了目安」を、今日中の時刻ではなく、現在登録されている全タスクが
+ * この先の容量ペースで消化されていくと計算上何日に終わるか、という
+ * 日付の目安に置き換えたもの（以前の「負荷×15分」による今日の終了
+ * 時刻の概算は廃止した）。
  * ------------------------------------------------------------
- * タスクごとの所要時間は記録していないため、「負荷1につき約
- * MINUTES_PER_LOAD分」という粗い仮定で概算する。正確な所要時間の
- * 見積もりではなく、あくまで目安。残りが無ければ表示しない。
+ * 計算そのものは Planner.estimateAllTasksFinishDate（純粋関数）が
+ * 持つ。ここでは「今日の容量をどう解決するか」（Store.getCapacityFor）
+ * を注入し、表示用の文字列に整形するだけ（憲法6条）。
  */
-const MINUTES_PER_LOAD = 15;
-function estimateFinishLabel(pendingLoad) {
-  if (!(pendingLoad > 0)) return null;
-  const finish = new Date(Date.now() + pendingLoad * MINUTES_PER_LOAD * 60000);
-  return String(finish.getHours()).padStart(2, '0') + ':' + String(finish.getMinutes()).padStart(2, '0');
+function estimateAllTasksFinishLabel(today, doneLoad) {
+  const finishDate = Planner.estimateAllTasksFinishDate({
+    tasks: state.tasks,
+    todayStr: today,
+    capacityForDate: (dateStr) => Store.getCapacityFor(state, dateStr),
+    alreadyDoneLoad: doneLoad,
+  });
+  if (!finishDate) return null;
+  if (finishDate === today) return '今日中';
+  const d = new Date(finishDate + 'T00:00:00');
+  const w = ['日', '月', '火', '水', '木', '金', '土'][d.getDay()];
+  return `${d.getMonth() + 1}/${d.getDate()}（${w}）`;
 }
 
 /** 「今日」という日付の時点で済んでいるか（plan.entriesに依存しない） */
@@ -722,6 +735,8 @@ function renderSettingsPage() {
         <button class="btn btn-secondary btn-full" onclick="Temper.exportBackup()">バックアップを書き出す</button>
       </div>
     </div>
+
+    <div class="settings-version">Temper ${APP_VERSION}</div>
   `;
 }
 

@@ -23,16 +23,93 @@ const WEATHER_CODE_MAP = {
 };
 
 /**
+ * iOSのホーム画面PWA（display:standalone）では、位置情報の許可ダイアログ
+ * 自体が表示されないまま navigator.geolocation.getCurrentPosition() の
+ * コールバックがいつまでも呼ばれない、という既知の不具合がある
+ * （通常のSafariタブでは正常に動く／standaloneだけ起きる。iOSの
+ * バージョンによっては渡した{timeout}オプションも無視される）。
+ * このため呼び出し側の`timeout`オプションだけに頼らず、ここでも
+ * 独立したタイマーで必ず一定時間内に resolve(null) することで、
+ * 「天気の取得に失敗しました」のまま画面が固まらないようにする
+ * （憲法11条: 失敗しても主機能は継続）。
+ */
+const GEO_HARD_TIMEOUT_MS = 8000;
+
+/**
  * @returns {Promise<{lat:number, lon:number}|null>}
  */
 function getGeolocation() {
   return new Promise((resolve) => {
     if (!navigator.geolocation) { resolve(null); return; }
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    // ブラウザ側のtimeoutオプションが効かないケースへの保険。
+    const hardTimer = setTimeout(() => finish(null), GEO_HARD_TIMEOUT_MS);
     navigator.geolocation.getCurrentPosition(
-      (pos) => resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
-      () => resolve(null),
+      (pos) => { clearTimeout(hardTimer); finish({ lat: pos.coords.latitude, lon: pos.coords.longitude }); },
+      () => { clearTimeout(hardTimer); finish(null); },
       { timeout: 6000, maximumAge: 600000 }
     );
+  });
+}
+
+/**
+ * IPアドレスからのおおまかな現在地推定（端末の位置情報とは別経路）。
+ * ------------------------------------------------------------
+ * 端末の位置情報(navigator.geolocation)は許可ダイアログの表示自体に
+ * 依存するため、iOSのstandalone PWAでダイアログが出ない不具合を踏むと
+ * ユーザーがSafari側で許可済みでもお手上げになる。IPベースの推定は
+ * ブラウザの許可プロンプトを一切経由せず（＝そのバグの影響を受けず）
+ * 常に応答するため、位置の精度は市区町村程度に粗くなるが、天気の
+ * 表示（気温・晴れ/曇り/雨）用途には十分な代替経路になる。
+ * どこの誰かを特定する用途では使わないこと（憲法にある通り外部送信は
+ * Open-Meteo/このIP推定のみで、いずれも位置を保存・記録はしない）。
+ */
+async function getIPGeolocation() {
+  try {
+    const res = await fetch('https://ipapi.co/json/', { signal: AbortSignal.timeout(6000) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const lat = data && data.latitude;
+    const lon = data && data.longitude;
+    if (typeof lat !== 'number' || typeof lon !== 'number') return null;
+    return { lat, lon };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 端末の位置情報とIP推定を同時に走らせ、使える方を採る。
+ * ------------------------------------------------------------
+ * 単純に両方をPromise.allで待つと、端末側がすぐ成功する通常のケース
+ * （Safariの通常タブなど）でも、IP側の応答を律儀に待つ分だけ遅くなる。
+ * 端末側が成功したら（IP側の結果を待たず）即座にそれを使い、端末側が
+ * 失敗した／standalone特有の不具合でハングしている場合にだけIP側の
+ * 結果を待つ、という優先順位にすることで、両方のケースで無駄な
+ * 待ち時間を作らない。
+ */
+function resolveCoords() {
+  return new Promise((resolve) => {
+    let deviceDone = false;
+    let ipDone = false;
+    let ipResult = null;
+
+    getGeolocation().then((device) => {
+      deviceDone = true;
+      if (device) { resolve(device); return; }
+      if (ipDone) resolve(ipResult);
+    });
+
+    getIPGeolocation().then((ip) => {
+      ipResult = ip;
+      ipDone = true;
+      if (deviceDone) resolve(ipResult);
+    });
   });
 }
 
@@ -63,7 +140,7 @@ async function fetchWeather(coords) {
  */
 export async function getWeather(manualOverride = null) {
   if (manualOverride) return { condition: manualOverride, temperature: null, source: 'manual' };
-  const coords = await getGeolocation();
+  const coords = await resolveCoords();
   if (!coords) return null;
   const weather = await fetchWeather(coords);
   if (!weather) return null;

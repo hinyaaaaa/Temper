@@ -553,6 +553,82 @@ function toEntry(task, src, overCapacity) {
    短い理由文を組み立てる。常時表示はしない（長押しで確認する設計、
    SPEC §11, §17）。
    ------------------------------------------------------------ */
+/* ------------------------------------------------------------
+   全タスク完了目安（進捗カードに小さく添える日付の見積もり）
+   ------------------------------------------------------------
+   以前は「今日の残り負荷 × 15分」で今日中の終了“時刻”を出していたが、
+   これは今日のタスクしか見ていなかった。ここでは発想を変え、
+   「今登録されている全ての単発(once)タスクを、この先の容量ペースで
+   このまま消化していくと、計算上いつ終わるか」という“日付”を出す。
+
+   週次(weekly)タスクは終わりのないシリーズなので「完了日」の対象には
+   含めない（§4, HANDOFF §1）が、毎回その曜日の容量を消費する存在
+   なので、単発タスクに残せる1日あたりの予算を計算するときにはきちんと
+   差し引く（そうしないと、週次タスクの分まで単発タスクに割り振って
+   しまい、見積もりが楽観的になりすぎる）。
+
+   タスクごとの正確な所要時間・優先順位までは追わない、あくまで
+   「総負荷 ÷ 日々の実質容量」の粗い目安（憲法7条: 評価的な意味づけは
+   しない、SPEC の目安表示と同じ位置づけ）。
+   ------------------------------------------------------------ */
+
+/** @param {string} dateStr, @param {number} n days to add → 'YYYY-MM-DD' */
+function addDays(dateStr, n) {
+  const d = new Date(dateStr + 'T00:00:00');
+  d.setDate(d.getDate() + n);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+/**
+ * @param {object} args
+ * @param {Array} args.tasks 全タスク
+ * @param {string} args.todayStr 'YYYY-MM-DD'
+ * @param {(dateStr:string)=>number} args.capacityForDate その日の容量を
+ *   返す関数（平日/休日・手動上書きの解決はStore側の責務なので、ここは
+ *   関数を受け取るだけにして依存しない。憲法6条）
+ * @param {number} [args.alreadyDoneLoad] 今日すでに完了した分（今日の
+ *   残り予算からだけ差し引く。翌日以降には影響しない）
+ * @param {number} [args.maxDays] 無限ループ防止の打ち切り日数
+ * @returns {string|null} 完了予定日('YYYY-MM-DD')。単発の残タスクが
+ *   無ければ null（呼び出し側は表示自体を隠す）。打ち切り日数を超えて
+ *   終わらない場合も null（見積もりようがないため）。
+ */
+export function estimateAllTasksFinishDate({
+  tasks,
+  todayStr,
+  capacityForDate,
+  alreadyDoneLoad = 0,
+  maxDays = 3650,
+}) {
+  let remaining = tasks
+    .filter((t) => t.type !== 'weekly' && !t.done)
+    .reduce((sum, t) => sum + safeLoad(t.load), 0);
+  if (remaining <= 0) return null;
+
+  let dateStr = todayStr;
+  for (let i = 0; i < maxDays; i++) {
+    const weekday = new Date(dateStr + 'T00:00:00').getDay();
+    const capacity = Math.max(0, Number(capacityForDate(dateStr)) || 0);
+
+    // その日、週次タスクが先取りする分（今日はまだ済んでいないもの限定。
+    // 翌日以降はまだ発生していないので常に先取りされると見なす）。
+    const weeklyLoad = tasks
+      .filter((t) => t.type === 'weekly'
+        && Array.isArray(t.weekDays) && t.weekDays.includes(weekday)
+        && !(t.deadline && dateStr > t.deadline)
+        && (i > 0 || isTaskPendingOn(t, dateStr)))
+      .reduce((sum, t) => sum + safeLoad(t.load), 0);
+
+    let dayBudget = Math.max(0, capacity - weeklyLoad);
+    if (i === 0) dayBudget = Math.max(0, dayBudget - (Number(alreadyDoneLoad) > 0 ? Number(alreadyDoneLoad) : 0));
+
+    remaining -= dayBudget;
+    if (remaining <= 0) return dateStr;
+    dateStr = addDays(dateStr, 1);
+  }
+  return null;
+}
+
 export function explainSelection(entry) {
   const parts = [];
   if (entry.src === 'overdue') parts.push('期限を過ぎているため');
