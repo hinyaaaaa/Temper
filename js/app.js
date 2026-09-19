@@ -16,6 +16,7 @@ import * as Weather from './weather.js';
 let state = Store.loadState();
 let currentPage = 'today';
 let currentTodayPlan = null;
+let currentPlanDate = null; // currentTodayPlan がどの日付向けに作られたか
 let editingTaskId = null;
 let weatherState = null;   // { condition, temperature, source } | null（取得失敗時）
 let pendingImport = null;  // インポート確認中のデータ
@@ -27,11 +28,29 @@ const todayStr = () => {
 
 function persist() { Store.saveState(state); }
 
+/**
+ * 今日という日付の時点で完了しているタスクのLoad合計。
+ * ------------------------------------------------------------
+ * recomputeTodayPlan()（Plannerへ渡す「既に使った予算」として）と
+ * renderTodayPage()（画面表示用）の両方から参照する、単一の計算箇所。
+ */
+function computeDoneLoadToday(dateStr) {
+  return state.tasks
+    .filter((t) => Store.isTaskDoneToday(t, dateStr))
+    .reduce((sum, t) => sum + (t.load || 0), 0);
+}
+
 /* ------------------------------------------------------------
    今日のプラン再計算
    ------------------------------------------------------------
    「今日は平日か休日か」「その日の容量はいくつか」の解決は store.js が
    持つ設定の話であり、Plannerは数値だけを受け取る（憲法6条）。
+
+   alreadyDoneLoad（今日すでに完了した分のLoad合計）を渡すのは、
+   完了後にキャパシティを変更したときに「完了済みの分」と「新しく
+   選び直された分」を合わせた合計が容量を超えて見える不具合
+   （例: 16/15）を避けるため。Planner側は「まだ使っていない予算」の
+   中だけで残りのタスクを選ぶので、二重に容量を使うことがない。
    ------------------------------------------------------------ */
 function recomputeTodayPlan() {
   const today = todayStr();
@@ -42,7 +61,28 @@ function recomputeTodayPlan() {
     weekdayStats: Store.deriveWeekdayStats(state),
     weekdayPatternStats: Store.deriveWeekdayPatternStats(state),
     patternHistory: Store.derivePatternHistory(state),
+    alreadyDoneLoad: computeDoneLoadToday(today),
   });
+  currentPlanDate = today;
+}
+
+/**
+ * 日付が変わっていたら（アプリを閉じずに日をまたいだ場合など）
+ * 今日のプランを作り直す。
+ * ------------------------------------------------------------
+ * 「今日」タブが日付をまたいでも自動的に反映されない不具合の対策。
+ * currentTodayPlan は明示的にrecomputeTodayPlan()を呼んだ時にしか
+ * 更新されない作りだったため、タスクの完了・編集・設定変更などの
+ * 操作を何もしないまま日付が変わると、前日の期限計算・曜日・
+ * 容量に基づいたプランが画面に残り続けてしまっていた
+ * （前日は候補にならなかった「今日解禁」「今日が対象曜日」のタスクが
+ * 出てこない、期限の残り日数がずれる、平日/休日や容量が前日のまま、
+ * といった食い違いが起きる）。render()の入口で必ずこれを通すことで、
+ * どの画面遷移・操作をきっかけにしても日付のズレを解消する。
+ */
+function ensureTodayPlanFresh() {
+  const today = todayStr();
+  if (currentPlanDate !== today) recomputeTodayPlan();
 }
 
 /* ------------------------------------------------------------
@@ -60,6 +100,7 @@ function navigateTo(page) {
 function render() {
   const root = document.getElementById('page-root');
   try {
+    ensureTodayPlanFresh();
     if (currentPage === 'today') root.innerHTML = renderTodayPage();
     else if (currentPage === 'tasks') root.innerHTML = renderTasksPage();
     else if (currentPage === 'settings') root.innerHTML = renderSettingsPage();
@@ -155,9 +196,7 @@ function renderTodayPage() {
   // 消えてしまうことがない（plan.entries に残っているかどうかに
   // 依存しないため）。
   const pendingEntries = plan.entries.filter((e) => !isTaskDoneToday(e.id, today));
-  const doneLoad = state.tasks
-    .filter((t) => Store.isTaskDoneToday(t, today))
-    .reduce((sum, t) => sum + (t.load || 0), 0);
+  const doneLoad = computeDoneLoadToday(today);
   // plan.totalLoad は「完了前に選ばれた時点」の合計なので、完了後も
   // そのまま使うと doneLoad と二重に数えてしまう（完了させても
   // recomputeTodayPlan() を呼ばないため、plan.entries に完了済みの
@@ -165,7 +204,11 @@ function renderTodayPage() {
   // 合計し直すことで二重計上を避ける。
   const pendingLoad = pendingEntries.reduce((sum, e) => sum + e.load, 0);
   const totalLoad = doneLoad + pendingLoad;
-  const capacity = plan.effectiveCapacity;
+  // 分母は「今日1日の目標容量」(fullCapacity)。plan.effectiveCapacity は
+  // Plannerが残りタスクを選ぶ際に使った「まだ使っていない予算」
+  // （fullCapacityからdoneLoadを引いたもの）なので、表示の分母には使わない
+  // — これを分母にすると、完了が進むほど分母が縮んでいく不自然な表示になる。
+  const capacity = plan.fullCapacity;
 
   const C = 2 * Math.PI * 23;
   const frac = (v) => (capacity > 0 ? Math.min(1, v / capacity) : 0);
@@ -174,6 +217,7 @@ function renderTodayPage() {
 
   const timeOfDay = Weather.getTimeOfDay();
   const condition = weatherState ? weatherState.condition : 'clear';
+  const finishLabel = estimateFinishLabel(pendingLoad);
 
   let taskListHtml;
   if (!plan.entries.length && doneLoad === 0) {
@@ -200,6 +244,7 @@ function renderTodayPage() {
         <div class="progress-text">
           <div class="progress-value">今日の負荷　<b>${totalLoad}</b> / ${capacity}</div>
           <div class="progress-sub">${pendingEntries.length}件が残っています${doneLoad > 0 ? `　（消化 ${doneLoad}）` : ''}</div>
+          ${finishLabel ? `<div class="progress-finish">終了目安 ${finishLabel}</div>` : ''}
         </div>
       </div>
     </div>
@@ -207,6 +252,20 @@ function renderTodayPage() {
     <div class="section-label">今日のタスク</div>
     <div id="today-task-list">${taskListHtml}</div>
   `;
+}
+
+/**
+ * 残りの負荷から、終了目安の時刻を概算する（小さく添える程度の目安）。
+ * ------------------------------------------------------------
+ * タスクごとの所要時間は記録していないため、「負荷1につき約
+ * MINUTES_PER_LOAD分」という粗い仮定で概算する。正確な所要時間の
+ * 見積もりではなく、あくまで目安。残りが無ければ表示しない。
+ */
+const MINUTES_PER_LOAD = 15;
+function estimateFinishLabel(pendingLoad) {
+  if (!(pendingLoad > 0)) return null;
+  const finish = new Date(Date.now() + pendingLoad * MINUTES_PER_LOAD * 60000);
+  return String(finish.getHours()).padStart(2, '0') + ':' + String(finish.getMinutes()).padStart(2, '0');
 }
 
 /** 「今日」という日付の時点で済んでいるか（plan.entriesに依存しない） */
@@ -661,7 +720,6 @@ function renderSettingsPage() {
           JSONファイルから読み込む
         </button>
         <button class="btn btn-secondary btn-full" onclick="Temper.exportBackup()">バックアップを書き出す</button>
-        <button class="btn btn-secondary btn-full" onclick="Temper.exportHistory()">学習履歴を書き出す</button>
       </div>
     </div>
   `;
@@ -769,12 +827,17 @@ function downloadJson(json, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function exportHistory() {
-  downloadJson(Store.exportHistoryJson(state), `temper_history_${todayStr()}.json`);
-  showToast('書き出しました');
-}
+/**
+ * 書き出すファイル名は日付を含めない固定名にしてある。
+ * ------------------------------------------------------------
+ * 以前は `temper_backup_2026-09-17.json` のように日付を含めていたが、
+ * 毎回ファイル名が変わるとダウンロードフォルダに増え続け、
+ * 「前回書き出したファイルに上書き保存する」という使い方がしづらかった。
+ * 固定名にすることで、毎回同じファイルへの上書きが簡単になる
+ * （アップロード時に見た `TaskNOVA_save_data.json` の命名に倣った）。
+ */
 function exportBackup() {
-  downloadJson(Store.exportBackupJson(state), `temper_backup_${todayStr()}.json`);
+  downloadJson(Store.exportBackupJson(state), 'Temper_save_data.json');
   showToast('書き出しました');
 }
 
@@ -971,6 +1034,18 @@ function init() {
     render();
     refreshWeather();
     setInterval(applySky, 5 * 60 * 1000);
+    // 何も操作しないままアプリを開きっぱなしで日付をまたいだ場合でも
+    // 今日のプランが古いまま残らないよう、1分おきに日付の変化を確認する。
+    // render()自身もensureTodayPlanFresh()で日付を見るが、それは何らかの
+    // 操作（タップ等）が起きたときにしか呼ばれないため、無操作のまま
+    // 日をまたぐケースはこの定期チェックが無いと拾えない。
+    setInterval(() => {
+      const today = todayStr();
+      if (currentPlanDate !== today) {
+        recomputeTodayPlan();
+        if (currentPage === 'today') render();
+      }
+    }, 60 * 1000);
 
     document.querySelectorAll('.overlay').forEach((overlay) => {
       overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.classList.remove('open'); });
@@ -991,7 +1066,7 @@ window.Temper = {
   openAddTask, openEditTask, deleteTask, saveTaskFromModal, closeTaskModal,
   onLoadSliderInput, stepLoad, clearDateField, setTaskType, toggleModalWeekDay,
   onCapacityInput, stepCapacity, toggleWeatherAuto,
-  pickImportFile, exportHistory, exportBackup,
+  pickImportFile, exportBackup,
 };
 
 document.addEventListener('DOMContentLoaded', init);

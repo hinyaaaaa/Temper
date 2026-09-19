@@ -567,11 +567,6 @@ export function derivePatternHistory(state) {
 /* ------------------------------------------------------------
    書き出し
    ------------------------------------------------------------ */
-/** 外部分析用（履歴と統計のみ） */
-export function exportHistoryJson(state) {
-  return JSON.stringify({ exportedAt: new Date().toISOString(), history: state.history, stats: state.stats }, null, 2);
-}
-
 /** 復元用のフルバックアップ。importInto がそのまま読み戻せる形にする。 */
 export function exportBackupJson(state) {
   return JSON.stringify({

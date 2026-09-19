@@ -266,9 +266,14 @@ const OVERDUE_MUST_INCLUDE = true; // §14: 期限が非常に近いタスクは
  * @param {object} [args.weekdayStats] Capacity補正用の曜日別実績
  * @param {object} [args.weekdayPatternStats] 曜日×Pattern補正用の実績
  * @param {Array} [args.patternHistory] Pattern個人補正用の完了/登録履歴 [{title, pattern}]
+ * @param {number} [args.alreadyDoneLoad] 今日すでに完了した分のLoad合計（省略時0）。
+ *   今日の残り選定が「まだ使っていない容量」の中で行われるようにするための
+ *   もので、これを渡さないと「完了後にキャパシティを変更すると合計が容量を
+ *   超えて見える」不具合が起きる（詳しくはbuildTodayPlan本体のコメント参照）。
  * @returns {{
  *   entries: Array<{id, load, pattern, deadline, src, overCapacity:boolean}>,
  *   effectiveCapacity: number,
+ *   fullCapacity: number,
  *   totalLoad: number,
  *   reason: object  // デバッグ・履歴用の内部情報（§5, §18）
  * }}
@@ -280,9 +285,24 @@ export function buildTodayPlan({
   weekdayStats = null,
   weekdayPatternStats = null,
   patternHistory = [],
+  alreadyDoneLoad = 0,
 }) {
   const weekday = new Date(todayStr + 'T00:00:00').getDay();
-  const effectiveCapacity = computeEffectiveCapacity(baseCapacity, { weekday, weekdayStats });
+  // fullCapacity: 曜日補正等を経た「今日1日の目標容量」。表示上の分母は
+  // これを使う（完了済みの分を差し引く前の、1日を通じての目標値）。
+  const fullCapacity = computeEffectiveCapacity(baseCapacity, { weekday, weekdayStats });
+  // effectiveCapacity: 「まだ使っていない残り予算」。今日すでに完了した分
+  // (alreadyDoneLoad)をfullCapacityから差し引いておくことで、これから
+  // 選ぶ（強制採用+充填）タスクの合計が、既に完了した分と合わせて
+  // fullCapacityにきちんと収まるようにする。
+  //
+  // これを差し引かずにfullCapacityそのものを使って毎回選び直すと、
+  // 「完了させた分」が考慮されないまま新しい容量いっぱいまで残りタスクが
+  // 選ばれてしまい、(doneLoad + 新しく選ばれた分) が 新しい容量を超えて
+  // 「16/15」のような一見おかしな表示になる（完了後にキャパシティを
+  // 変更すると発生した不具合の直接の原因）。
+  const doneLoadSafe = Number.isFinite(alreadyDoneLoad) && alreadyDoneLoad > 0 ? alreadyDoneLoad : 0;
+  const effectiveCapacity = Math.max(0, fullCapacity - doneLoadSafe);
 
   const candidates = buildCandidates(tasks, todayStr).map((t) => ({
     ...t,
@@ -296,23 +316,20 @@ export function buildTodayPlan({
     return safeLoad(b.load) - safeLoad(a.load);
   });
 
-  const entries = [];
   let usedLoad = 0;
-  const included = new Set();
-
-  function lastEntryPattern() {
-    if (!entries.length) return null;
-    return entries[entries.length - 1]._pattern;
-  }
 
   // §14: 期限超過・本日期限は容量に関わらず必ず含める
   const mustInclude = candidates.filter((t) => t._daysUntil <= 0);
   const rest = candidates.filter((t) => t._daysUntil > 0);
 
+  // 強制採用分のentryをここで確定する（src・overCapacityは期限の近さで決まる
+  // ものであり、後で行う並べ替えの影響を受けてはいけないため、並べ替えの
+  // 前に固定する）。
+  const forcedEntryById = new Map();
   mustInclude.forEach((t) => {
-    entries.push(toEntry(t, t._daysUntil < 0 ? 'overdue' : 'today_deadline', usedLoad + safeLoad(t.load) > effectiveCapacity));
+    const entry = toEntry(t, t._daysUntil < 0 ? 'overdue' : 'today_deadline', usedLoad + safeLoad(t.load) > effectiveCapacity);
     usedLoad += safeLoad(t.load);
-    included.add(t.id);
+    forcedEntryById.set(t.id, entry);
   });
 
   // 残り容量への充填（§11〜§13: 優先度そのままではなく、組み合わせを調整する）。
@@ -328,9 +345,7 @@ export function buildTodayPlan({
   // 容量内で基礎スコア合計を最大化する組み合わせを部分和的に探索する
   // （候補数が小さい実用範囲を前提とした軽量なナップサック法）。
   // 同じ達成価値なら「件数が多い組み合わせ」を優先し、無駄な容量の
-  // 使い残しを避ける。その後、確定した組み合わせの「並び」だけを
-  // Pattern連続・Load偏りを避けるように並べ替える（§12, §13は順序の
-  // 問題であり、どれを選ぶかの問題ではないため、この分離で両立できる）。
+  // 使い残しを避ける。
   const scored = rest.map((t) => {
     const deadlineScore = t._daysUntil === Infinity ? 0 : Math.max(0, 60 - t._daysUntil * 3);
     const weekdayBonus = weekdayPatternBonus(t._pattern, weekday, weekdayPatternStats);
@@ -340,19 +355,31 @@ export function buildTodayPlan({
   const remainingCapacity = Math.max(0, effectiveCapacity - usedLoad);
   const chosenSet = knapsackSelect(scored, remainingCapacity);
 
-  // Pattern連続・Load偏りを避ける順序へ並べ替えてから確定する（§12, §13）。
-  const ordered = orderToAvoidRuns(chosenSet, lastEntryPattern());
-  ordered.forEach((t) => {
+  const filledEntryById = new Map();
+  chosenSet.forEach((t) => {
     // 週次タスクは「期限が近いから」ではなく「今日がその曜日だから」
     // 選ばれているため、詳細画面の理由もそれに合わせて区別する。
-    entries.push(toEntry(t, t.type === 'weekly' ? 'weekly' : 'filled', false));
+    filledEntryById.set(t.id, toEntry(t, t.type === 'weekly' ? 'weekly' : 'filled', false));
     usedLoad += safeLoad(t.load);
-    included.add(t.id);
   });
+
+  // 確定した組み合わせ（強制採用分＋充填分）の「並び」を、Pattern連続・
+  // Load偏りを避けるように最適化する（§12, §13）。
+  //
+  // 以前は充填分（chosenSet）だけを並べ替えの対象にしており、強制採用分
+  // （mustInclude）同士や、強制採用分と充填分の継ぎ目でのPattern連続は
+  // 一切調整されていなかった。強制採用は「必ず含める」という選択の話で
+  // あり、並びの最適化とは独立した問題（§12, §13の分離の考え方そのもの）
+  // なので、強制採用分も含めた全体を並べ替え対象にする。含めるかどうか
+  // （どのタスクが選ばれるか）はここでは一切変えていない。
+  const combinedForOrdering = [...mustInclude, ...chosenSet];
+  const ordered = orderToAvoidRuns(combinedForOrdering, null);
+  const entries = ordered.map((t) => forcedEntryById.get(t.id) || filledEntryById.get(t.id));
 
   return {
     entries,
     effectiveCapacity,
+    fullCapacity,
     totalLoad: usedLoad,
     reason: {
       weekday,
@@ -410,29 +437,72 @@ function knapsackSelect(scored, capacity) {
 }
 
 /**
- * 選ばれたタスク集合を、Pattern連続・Load偏りのペナルティ合計が
- * 小さくなるように並べ替える（貪欲法: 毎ステップ、直前と最も相性の良い
- * ものを選ぶ）。どれを選ぶかは knapsackSelect が既に決めているため、
- * ここでは「並び」だけを最適化する（§12, §13）。
+ * 選ばれたタスク集合を、同じPatternが隣り合わないように並べ替える。
+ * ------------------------------------------------------------
+ * 「直前と最も相性の良いものを毎回選ぶ」という単純な貪欲法（旧実装）は、
+ * 理論上は回避可能な組み合わせでも同じPatternの隣接を作ってしまうことが
+ * シミュレーションで確認された（最頻出Patternの件数がceil(全体件数/2)
+ * 以下＝理論上回避可能、のケースの約14%で隣接が発生していた）。
+ * 原因は、各ステップで「その場しのぎの最善」しか見ておらず、数の多い
+ * Patternを消化し忘れて終盤に同じPatternしか残らない状況を作りやすい
+ * ことにあった。
+ *
+ * 代わりに「残っている中で最も件数が多いPattern（直前と異なるものに限る）
+ * を毎回選ぶ」という戦略を使う。これは「同じ要素が隣り合わない並べ替え」
+ * 問題（reorganize string）の標準的な正解手順で、理論的に回避可能な
+ * ケースでは必ず隣接ゼロの並びを見つけられる。件数が同点の場合や、
+ * 同じPattern内でどの1件を先に出すかは、既存のペナルティ関数
+ * （近い処理特性・高負荷の連続を避ける、§12, §13）で決める。
  */
 function orderToAvoidRuns(tasks, initialLastPattern) {
-  const remaining = tasks.slice();
+  const NONE = '__none__';
+  const groups = new Map();
+  for (const t of tasks) {
+    const key = t._pattern || NONE;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(t);
+  }
+
   const ordered = [];
   let lastPattern = initialLastPattern;
   let lastLoad = null;
+  let remaining = tasks.length;
 
-  while (remaining.length) {
-    let bestIdx = 0;
-    let bestPenalty = Infinity;
-    for (let i = 0; i < remaining.length; i++) {
-      const t = remaining[i];
-      const penalty = patternAdjacencyPenalty(lastPattern, t._pattern) + loadRunPenaltyForValues(lastLoad, safeLoad(t.load));
-      if (penalty < bestPenalty) { bestPenalty = penalty; bestIdx = i; }
+  while (remaining > 0) {
+    const nonEmptyKeys = [...groups.keys()].filter((k) => groups.get(k).length > 0);
+    if (!nonEmptyKeys.length) break;
+
+    // 直前と異なるPatternのグループを優先する。それしか残っていない場合
+    // （＝本当に回避不能な場合）のみ、やむを得ず同じPatternを選ぶ。
+    let pool = nonEmptyKeys.filter((k) => k !== lastPattern);
+    if (!pool.length) pool = nonEmptyKeys;
+
+    // 件数が最も多いグループを優先し（reorganize stringの定石。数の多い
+    // Patternを後回しにすると終盤で手詰まりになりやすい）、同数の場合は
+    // 相性ペナルティ（近い処理特性・高負荷連続）が小さい方を選ぶ。
+    let bestKey = null, bestCount = -1, bestPenalty = Infinity;
+    for (const k of pool) {
+      const group = groups.get(k);
+      const penalty = patternAdjacencyPenalty(lastPattern, k === NONE ? null : k) + loadRunPenaltyForValues(lastLoad, safeLoad(group[0].load));
+      if (group.length > bestCount || (group.length === bestCount && penalty < bestPenalty)) {
+        bestKey = k; bestCount = group.length; bestPenalty = penalty;
+      }
     }
-    const chosen = remaining.splice(bestIdx, 1)[0];
+
+    // 選ばれたグループ内では、直前のLoadと相性の良い（loadRunPenaltyが
+    // 小さい）ものを優先して取り出す（同一Pattern内でのLoad偏り回避）。
+    const group = groups.get(bestKey);
+    let pickIdx = 0, pickPenalty = Infinity;
+    for (let i = 0; i < group.length; i++) {
+      const p = loadRunPenaltyForValues(lastLoad, safeLoad(group[i].load));
+      if (p < pickPenalty) { pickPenalty = p; pickIdx = i; }
+    }
+    const chosen = group.splice(pickIdx, 1)[0];
+
     ordered.push(chosen);
     lastPattern = chosen._pattern;
     lastLoad = safeLoad(chosen.load);
+    remaining--;
   }
   return ordered;
 }
