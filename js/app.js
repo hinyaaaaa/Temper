@@ -22,7 +22,7 @@ let weatherState = null;   // { condition, temperature, source } | null（取得
 let pendingImport = null;  // インポート確認中のデータ
 
 /** 設定タブに小さく表示するだけの表示用バージョン。改修のたびに上げる。 */
-const APP_VERSION = 'v1.6.0';
+const APP_VERSION = 'v1.6.1';
 
 const todayStr = () => {
   const d = new Date();
