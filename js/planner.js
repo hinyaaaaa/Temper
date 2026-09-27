@@ -322,12 +322,20 @@ export function buildTodayPlan({
   const mustInclude = candidates.filter((t) => t._daysUntil <= 0);
   const rest = candidates.filter((t) => t._daysUntil > 0);
 
-  // 強制採用分のentryをここで確定する（src・overCapacityは期限の近さで決まる
-  // ものであり、後で行う並べ替えの影響を受けてはいけないため、並べ替えの
-  // 前に固定する）。
+  // 強制採用分のentryをここで確定する（src は期限の近さで決まるものなので
+  // 並べ替えの前に固定してよい）。
+  //
+  // overCapacityだけは、この時点ではまだ決めない。以前はここで
+  // 「mustIncludeの期限順」における累積Loadから判定していたが、
+  // ユーザーが実際に目にする並びは後段のorderToAvoidRuns（Pattern連続・
+  // Load偏り回避）を経た「表示順」であり、両者は一致するとは限らない
+  // （例えば期限順では3番目だったタスクが、Pattern分散のため表示上は
+  // 1番目に来ることがある）。overCapacityは「表示順で見ていったとき、
+  // どのタスクから容量を超えるか」を表す値であるべきなので、最終的な
+  // 表示順が確定した後（ordered確定後）にまとめて計算し直す。
   const forcedEntryById = new Map();
   mustInclude.forEach((t) => {
-    const entry = toEntry(t, t._daysUntil < 0 ? 'overdue' : 'today_deadline', usedLoad + safeLoad(t.load) > effectiveCapacity);
+    const entry = toEntry(t, t._daysUntil < 0 ? 'overdue' : 'today_deadline', false);
     usedLoad += safeLoad(t.load);
     forcedEntryById.set(t.id, entry);
   });
@@ -349,8 +357,12 @@ export function buildTodayPlan({
   const scored = rest.map((t) => {
     const deadlineScore = t._daysUntil === Infinity ? 0 : Math.max(0, 60 - t._daysUntil * 3);
     const weekdayBonus = weekdayPatternBonus(t._pattern, weekday, weekdayPatternStats);
-    return { task: t, value: Math.max(0.01, deadlineScore + weekdayBonus + 1) }; // +1: 期限なしタスクにも僅かな基礎価値を与える
+    return { task: t, deadlineScore, weekdayBonus, value: Math.max(0.01, deadlineScore + weekdayBonus + 1) }; // +1: 期限なしタスクにも僅かな基礎価値を与える
   });
+  // 選定理由の説明（explainSelection）が実際の判断根拠を正確に言い表せる
+  // よう、taskごとのdeadlineScore/weekdayBonusを引けるようにしておく。
+  // knapsackSelect自体はtask本体しか返さないため、このMapを経由する。
+  const scoreInfoById = new Map(scored.map((s) => [s.task.id, { deadlineScore: s.deadlineScore, weekdayBonus: s.weekdayBonus }]));
 
   const remainingCapacity = Math.max(0, effectiveCapacity - usedLoad);
   const chosenSet = knapsackSelect(scored, remainingCapacity);
@@ -359,7 +371,7 @@ export function buildTodayPlan({
   chosenSet.forEach((t) => {
     // 週次タスクは「期限が近いから」ではなく「今日がその曜日だから」
     // 選ばれているため、詳細画面の理由もそれに合わせて区別する。
-    filledEntryById.set(t.id, toEntry(t, t.type === 'weekly' ? 'weekly' : 'filled', false));
+    filledEntryById.set(t.id, toEntry(t, t.type === 'weekly' ? 'weekly' : 'filled', false, scoreInfoById.get(t.id)));
     usedLoad += safeLoad(t.load);
   });
 
@@ -375,6 +387,18 @@ export function buildTodayPlan({
   const combinedForOrdering = [...mustInclude, ...chosenSet];
   const ordered = orderToAvoidRuns(combinedForOrdering, null);
   const entries = ordered.map((t) => forcedEntryById.get(t.id) || filledEntryById.get(t.id));
+
+  // overCapacityの確定（表示順で見ていったときの強制採用分の累積Loadが
+  // effectiveCapacityを超えた時点からtrueにする。上のコメント参照）。
+  // 充填分(filled/weekly)は常にfalseのまま（元々effectiveCapacity内に
+  // 収まるよう選ばれているため）。
+  let runningForced = 0;
+  entries.forEach((e) => {
+    if (e.src === 'overdue' || e.src === 'today_deadline') {
+      runningForced += e.load;
+      e.overCapacity = runningForced > effectiveCapacity;
+    }
+  });
 
   return {
     entries,
@@ -535,7 +559,7 @@ function safeLoad(rawLoad) {
   return Number.isFinite(n) && n >= 1 ? n : 1;
 }
 
-function toEntry(task, src, overCapacity) {
+function toEntry(task, src, overCapacity, scoreInfo) {
   return {
     id: task.id,
     load: safeLoad(task.load),
@@ -543,6 +567,11 @@ function toEntry(task, src, overCapacity) {
     deadline: task.deadline || null,
     src, // 'overdue' | 'today_deadline' | 'weekly' | 'filled'
     overCapacity: !!overCapacity,
+    // 'filled'のみ持つ、選定理由の説明用の内部情報（§5, §11, §17）。
+    // 実際にナップサックの価値計算で使った値をそのまま持たせることで、
+    // explainSelection()が「本当の決め手」と食い違わないようにする。
+    deadlineScore: scoreInfo ? scoreInfo.deadlineScore : null,
+    weekdayBonus: scoreInfo ? scoreInfo.weekdayBonus : null,
   };
 }
 
@@ -629,13 +658,45 @@ export function estimateAllTasksFinishDate({
   return null;
 }
 
+/**
+ * 「今日選ばれた理由」の説明文を組み立てる（§5, §11, §17）。
+ * ------------------------------------------------------------
+ * 以前は src === 'filled' かつ期限があれば常に「期限が近いため」、
+ * 期限が無ければ常に「学習内容の偏りを避けるため」と固定で表示して
+ * いたが、これは不正確だった:
+ *   - 「学習内容の偏り」を避ける調整（orderToAvoidRuns、Pattern連続・
+ *     Load偏りの回避）は、あくまで確定した並び順を最適化するだけで、
+ *     どのタスクを選ぶか自体には関与しない（buildTodayPlan内の分離、
+ *     §12/§13）。そのため filled タスクの「選ばれた」理由としては
+ *     的外れで、実際は曜日別Pattern実績補正（weekdayPatternBonus）や
+ *     単なる残り容量の有効活用が決め手になっていることが多かった。
+ *   - 期限があっても deadlineScore がほぼ0（20日以上先）の場合、
+ *     実際にはweekdayBonusの方が選定に効いていることがあり得るのに
+ *     「期限が近いため」と言い切っていた。
+ * ここでは実際にナップサックの価値計算に使った deadlineScore /
+ * weekdayBonus の大小を比較し、どちらが決め手だったかで文言を出し
+ * 分ける。
+ */
 export function explainSelection(entry) {
   const parts = [];
-  if (entry.src === 'overdue') parts.push('期限を過ぎているため');
-  else if (entry.src === 'today_deadline') parts.push('今日が期限のため');
-  else if (entry.src === 'weekly') parts.push('毎週この曜日に行うため');
-  else if (entry.deadline) parts.push('期限が近いため');
-  else parts.push('学習内容の偏りを避けるため');
+  if (entry.src === 'overdue') {
+    parts.push('期限を過ぎているため');
+  } else if (entry.src === 'today_deadline') {
+    parts.push('今日が期限のため');
+  } else if (entry.src === 'weekly') {
+    parts.push('毎週この曜日に行うタスクのため');
+  } else {
+    // 'filled': 実際の価値計算に使った内訳から、決め手になった要因を判定する。
+    const deadlineScore = Number.isFinite(entry.deadlineScore) ? entry.deadlineScore : 0;
+    const weekdayBonus = Number.isFinite(entry.weekdayBonus) ? entry.weekdayBonus : 0;
+    if (deadlineScore > 0 && deadlineScore >= weekdayBonus) {
+      parts.push('期限が近いため');
+    } else if (weekdayBonus > 0) {
+      parts.push('この曜日はこの種の学習が続きやすい実績があるため');
+    } else {
+      parts.push('今日の残り容量を活かして無理なく進められるため');
+    }
+  }
   if (entry.overCapacity) parts.push('容量を超えても今日中に扱う必要があるため');
   return parts.join('、');
 }

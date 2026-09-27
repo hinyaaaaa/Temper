@@ -378,27 +378,35 @@ function onCardPressStart(taskId) {
 }
 function onCardPressEnd() { clearTimeout(pressTimer); }
 
+/**
+ * 長押しで開く詳細シート。
+ * ------------------------------------------------------------
+ * 要件: 長押しで伝える情報は「今日選ばれた理由」のみに絞る
+ * （期限・解禁日・負荷・状態といった他の項目は、タスク一覧の編集画面
+ * などで既に確認できるため、ここで重複して並べない）。
+ * 編集への導線もここには置かず、一覧画面の編集アイコンに一本化する。
+ */
 function openDetailSheet(taskId) {
   const t = state.tasks.find((x) => x.id === taskId);
   if (!t) return;
   const entry = currentTodayPlan && currentTodayPlan.entries.find((e) => e.id === taskId);
-  const reason = entry ? Planner.explainSelection(entry) : null;
-  const weekly = t.type === 'weekly';
   const doneToday = Store.isTaskComplete(t, todayStr());
+
+  let reason;
+  if (entry) {
+    reason = Planner.explainSelection(entry);
+  } else if (doneToday) {
+    reason = '今日すでに完了しています';
+  } else {
+    reason = '今日の選定には含まれていません';
+  }
 
   document.getElementById('detail-sheet-body').innerHTML = `
     <div class="sheet-grabber"></div>
     <div class="sheet-title">${esc(t.title)}</div>
-    ${weekly
-      ? `<div class="sheet-row"><span class="sheet-row-label">曜日</span><span>毎週${esc(Store.weekDaysLabel(t.weekDays) || '未設定')}</span></div>`
-      : `<div class="sheet-row"><span class="sheet-row-label">期限</span><span>${t.deadline ? formatDateLabel(t.deadline) : 'なし'}</span></div>`}
-    <div class="sheet-row"><span class="sheet-row-label">解禁日</span><span>${t.unlockDate ? formatDateLabel(t.unlockDate) : 'なし'}</span></div>
-    <div class="sheet-row"><span class="sheet-row-label">負荷</span><span>${t.load} / 10</span></div>
-    <div class="sheet-row"><span class="sheet-row-label">状態</span><span>${doneToday ? (weekly ? '今日は完了' : '完了') : '未完了'}</span></div>
-    ${reason ? `<div class="sheet-note">今日選ばれた理由：${esc(reason)}</div>` : ''}
+    <div class="sheet-note">${esc(reason)}</div>
     <div class="sheet-actions">
       <button class="btn btn-secondary" onclick="Temper.closeDetailSheet()">閉じる</button>
-      <button class="btn btn-primary" onclick="Temper.closeDetailSheet();Temper.openEditTask('${t.id}')">編集する</button>
     </div>
   `;
   document.getElementById('detail-sheet').classList.add('open');
