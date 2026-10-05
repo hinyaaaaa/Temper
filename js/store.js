@@ -48,6 +48,13 @@ const STATE_DEFAULTS = {
   stats: {
     weekday: {},         // { [0-6]: { completed:number, missed:number } }
     weekdayPattern: {},  // { "0:memorization": { completed:number, missed:number } }
+    // recordMissedOccurrencesUntilToday()が「どこまで未達判定を処理済みか」
+    // を覚えておくための日付。null は「まだ一度もこの機能が走っていない」
+    // ことを表し、その場合は過去に遡って未達扱いにはしない
+    // （既存インストールに対して、導入前の未完了分を突然大量に
+    // "missed" として計上してしまうのを避けるため。ALGORITHM_IMPROVEMENT_PLAN
+    // §0 参照）。
+    lastMissCheckDate: null,
   },
 };
 
@@ -65,8 +72,18 @@ function clampInt(v, min, max, fallback) {
 /* ------------------------------------------------------------
    読み書き
    ------------------------------------------------------------ */
+/**
+ * 直近のloadState()の結果メモ。
+ * lost=true は「保存データが見つからなかった／壊れて読めなかった」ことを表し、
+ * 呼び出し側（app.js）が自動バックアップからの復元を試みる合図に使う。
+ * 初回起動でも lost=true になるが、その場合はバックアップも無いので何も起きない。
+ */
+let lastLoadInfo = { lost: false, reason: null };
+export function getLoadInfo() { return lastLoadInfo; }
+
 export function loadState() {
   let raw = null;
+  lastLoadInfo = { lost: false, reason: null };
   try {
     raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) {
@@ -76,12 +93,18 @@ export function loadState() {
       }
     }
   } catch (e) { /* ローカルストレージ不可環境（憲法11条: 主機能は継続） */ }
+  if (!raw) lastLoadInfo = { lost: true, reason: 'missing' };
 
   let state;
   try {
     state = raw ? { ...deepClone(STATE_DEFAULTS), ...JSON.parse(raw) } : deepClone(STATE_DEFAULTS);
   } catch (e) {
+    // 壊れたJSON。以前は黙って初期状態に戻し、次の保存で壊れた元データごと
+    // 上書きしていた（取り返しがつかない）。別キーに退避してから初期化する
+    // （憲法10条・16条: データの安全性が最優先）。
+    try { localStorage.setItem(STORAGE_KEY + '_corrupt', raw); } catch (e2) { /* 退避できなくても継続 */ }
     state = deepClone(STATE_DEFAULTS);
+    lastLoadInfo = { lost: true, reason: 'corrupt' };
   }
   return normalizeState(state);
 }
@@ -110,11 +133,13 @@ export function normalizeState(state) {
   if (!Array.isArray(s.holidayWeekdays)) s.holidayWeekdays = [0, 6];
   if (!s.dayTypeOverrides || typeof s.dayTypeOverrides !== 'object') s.dayTypeOverrides = {};
   s.weatherAutoLocation = s.weatherAutoLocation !== false;
+  delete s.chronotype; // 自己入力機能は廃止（HANDOFF §14）。旧保存データの残骸を落とす
   state.settings = s;
 
   state.stats = { ...deepClone(STATE_DEFAULTS.stats), ...(state.stats || {}) };
   if (!state.stats.weekday) state.stats.weekday = {};
   if (!state.stats.weekdayPattern) state.stats.weekdayPattern = {};
+  if (typeof state.stats.lastMissCheckDate !== 'string') state.stats.lastMissCheckDate = null;
 
   state.tasks = state.tasks.filter((t) => t && typeof t === 'object').map(normalizeTask);
 
@@ -533,10 +558,68 @@ export function recordMiss(state, task, dateStr) {
   wd.missed += 1;
   state.stats.weekday[weekday] = wd;
 
+  if (task.pattern) {
+    const key = `${weekday}:${task.pattern}`;
+    const wp = state.stats.weekdayPattern[key] || { completed: 0, missed: 0 };
+    wp.missed += 1;
+    state.stats.weekdayPattern[key] = wp;
+  }
+
   state.history.push({
     taskId: task.id, event: 'missed', pattern: task.pattern,
     load: task.load, deadline: task.deadline, date: dateStr, ts: Date.now(),
   });
+}
+
+/** 'YYYY-MM-DD' に n日足す（addDays(dateStr, -1)で前日も取れる） */
+function addDaysStr(dateStr, n) {
+  const d = new Date(dateStr + 'T00:00:00');
+  d.setDate(d.getDate() + n);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+/** タスクの作成日('YYYY-MM-DD')。それより前の日付は「まだ存在していなかった」ため対象外。 */
+function taskCreatedDateStr(task) {
+  const ts = Number(task.createdAt) || Date.now();
+  const d = new Date(ts);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+/**
+ * 週次タスクについて、前回チェックした日の翌日〜昨日までの間に「対象曜日
+ * だったのに doneDates に入らなかった（＝その日はやり切れなかった）」日を
+ * 検出し、recordMiss()で統計に反映する（ALGORITHM_IMPROVEMENT_PLAN §0）。
+ * ------------------------------------------------------------
+ * これが無いと stats.weekdayPattern の missed が常に0のままになり、
+ * Plannerの曜日×Pattern補正（weekdayPatternBonus）が「1回でも完了すれば
+ * 完了率100%」という統計的に無意味な値になってしまう。
+ *
+ * state.stats.lastMissCheckDate が null（導入前の既存データ）の場合は、
+ * 過去に遡って一括で未達判定を行わず、今日を起点として以後だけ記録する
+ * （既存ユーザーに対して過去分を突然大量にmissed扱いしないため）。
+ *
+ * 呼び出し側（app.js）は「日付が変わったことを検知したタイミング」で
+ * 一度だけ呼べばよい（内部でlastMissCheckDateにより冪等性を保つ）。
+ */
+export function recordMissedOccurrencesUntilToday(state, todayStr) {
+  const last = state.stats.lastMissCheckDate;
+  if (!last) {
+    state.stats.lastMissCheckDate = todayStr;
+    return;
+  }
+  if (last >= todayStr) return; // 同日中の複数回呼び出し・時計の巻き戻り等は何もしない
+
+  for (let d = addDaysStr(last, 1); d < todayStr; d = addDaysStr(d, 1)) {
+    const weekday = new Date(d + 'T00:00:00').getDay();
+    state.tasks
+      .filter((t) => t.type === 'weekly'
+        && Array.isArray(t.weekDays) && t.weekDays.includes(weekday)
+        && d >= taskCreatedDateStr(t)
+        && !(t.deadline && d > t.deadline)
+        && !(Array.isArray(t.doneDates) && t.doneDates.includes(d)))
+      .forEach((t) => recordMiss(state, t, d));
+  }
+  state.stats.lastMissCheckDate = todayStr;
 }
 
 /* ------------------------------------------------------------
@@ -560,6 +643,40 @@ export function deriveWeekdayPatternStats(state) {
   return out;
 }
 
+/**
+ * 完了した時刻（history.ts）から、「どのPatternをどの時間帯に完了しがちか」を数える（⑥）。
+ * 自己申告は使わず、実績だけから時間帯の個人差を学習するための元データ。
+ * 時間帯の区分(bucketOf)とPatternの推定(estimatePattern)は呼び出し側から渡す
+ * （区分の閾値はweather.jsのgetTimeOfDay()が唯一の定義元。憲法6条: 分離）。
+ *
+ * @param {object} state
+ * @param {{ bucketOf:(d:Date)=>string|null, estimatePattern?:(task:object)=>string|null }} deps
+ * @returns {{ total:object, byPattern:object }} 各 { dawn, day, dusk, night, all } の件数
+ */
+export function deriveTimeOfDayPatternStats(state, { bucketOf, estimatePattern } = {}) {
+  const zero = () => ({ dawn: 0, day: 0, dusk: 0, night: 0, all: 0 });
+  const total = zero();
+  const byPattern = {};
+  if (typeof bucketOf !== 'function') return { total, byPattern };
+  const taskById = new Map(state.tasks.map((t) => [t.id, t]));
+  state.history.forEach((h) => {
+    if (!h || h.event !== 'completed' || !Number.isFinite(h.ts)) return;
+    const tod = bucketOf(new Date(h.ts));
+    if (!tod || !(tod in total)) return;
+    let pattern = h.pattern;
+    if (!pattern) {
+      const t = taskById.get(h.taskId);
+      if (t) pattern = t.pattern || (estimatePattern ? estimatePattern(t) : null);
+    }
+    total[tod] += 1; total.all += 1;
+    if (pattern) {
+      const p = byPattern[pattern] || (byPattern[pattern] = zero());
+      p[tod] += 1; p.all += 1;
+    }
+  });
+  return { total, byPattern };
+}
+
 export function derivePatternHistory(state) {
   return state.tasks.filter((t) => t.pattern).map((t) => ({ title: t.title, pattern: t.pattern }));
 }
@@ -577,4 +694,144 @@ export function exportBackupJson(state) {
     stats: state.stats,
     settings: state.settings,
   }, null, 2);
+}
+
+/* ------------------------------------------------------------
+   自動バックアップ（受験向け⑤）
+   ------------------------------------------------------------
+   受験は数か月続く。localStorageはブラウザの都合（ストレージ逼迫・
+   「サイトデータの消去」・iOSの自動削除など）で消えうるため、ユーザーの
+   操作なしで、別の保存先（IndexedDB）に日次の世代バックアップを持つ。
+   - 復元も自動（app.jsが「保存データが無い/壊れている」時に最新を戻す）
+   - 空の状態は保存しない（消えた直後の空データで良いバックアップを
+     上書きしてしまわないため）
+   - IndexedDBが使えない環境では黙って何もしない（憲法11条）
+   ------------------------------------------------------------ */
+const SNAP_DB = 'temper_backup';
+const SNAP_STORE = 'snapshots';
+const SNAP_DAILY_DAYS = 14;   // 直近14日分は毎日残す
+const SNAP_WEEKLY_WEEKS = 12; // それより古い分は週ごとに最新1件、12週間まで
+const SNAP_THROTTLE_MS = 30 * 60 * 1000;
+
+function dateStrOf(d) {
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+function dayDiff(a, b) { // a - b（日数）
+  return Math.round((new Date(a + 'T00:00:00') - new Date(b + 'T00:00:00')) / 86400000);
+}
+function mondayOf(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  return dateStrOf(d);
+}
+
+/**
+ * 残すバックアップの日付集合を決める純粋関数。
+ * 直近 dailyDays 日は全部、それより古いものは週ごとの最新1件を
+ * weeklyWeeks 週ぶんだけ残す。
+ */
+export function selectSnapshotsToKeep(dates, todayStr, { dailyDays = SNAP_DAILY_DAYS, weeklyWeeks = SNAP_WEEKLY_WEEKS } = {}) {
+  const keep = new Set();
+  const weekly = new Map(); // 週の月曜 → その週の最新の日付
+  [...dates].sort().forEach((d) => {
+    const age = dayDiff(todayStr, d);
+    if (age < 0) { keep.add(d); return; } // 未来日付（時計のずれ）は触らない
+    if (age < dailyDays) { keep.add(d); return; }
+    if (age >= dailyDays + weeklyWeeks * 7) return;
+    weekly.set(mondayOf(d), d); // 昇順に処理しているので最後が最新
+  });
+  weekly.forEach((d) => keep.add(d));
+  return keep;
+}
+
+function idbRequest(req) {
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function openSnapDb() {
+  return new Promise((resolve) => {
+    try {
+      if (typeof indexedDB === 'undefined') { resolve(null); return; }
+      const req = indexedDB.open(SNAP_DB, 1);
+      req.onupgradeneeded = () => {
+        if (!req.result.objectStoreNames.contains(SNAP_STORE)) req.result.createObjectStore(SNAP_STORE, { keyPath: 'date' });
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+      req.onblocked = () => resolve(null);
+    } catch (e) { resolve(null); }
+  });
+}
+
+/** ブラウザに「このデータは勝手に消さないで」と依頼する（拒否されても何も起きない）。 */
+export async function requestPersistentStorage() {
+  try {
+    if (navigator.storage && navigator.storage.persist) return await navigator.storage.persist();
+  } catch (e) { /* 継続 */ }
+  return false;
+}
+
+/**
+ * 今日付けのバックアップを保存し、古い世代を整理する。
+ * @returns {Promise<boolean>} 保存したか
+ */
+export async function saveSnapshot(state, todayStr) {
+  if (!state || (state.tasks.length === 0 && state.history.length === 0)) return false;
+  const db = await openSnapDb();
+  if (!db) return false;
+  try {
+    const tx = db.transaction(SNAP_STORE, 'readwrite');
+    const store = tx.objectStore(SNAP_STORE);
+    store.put({ date: todayStr, savedAt: Date.now(), json: exportBackupJson(state) });
+    const keys = await idbRequest(store.getAllKeys());
+    const keep = selectSnapshotsToKeep(keys, todayStr);
+    keys.forEach((k) => { if (!keep.has(k)) store.delete(k); });
+    await new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error); });
+    return true;
+  } catch (e) {
+    return false;
+  } finally {
+    try { db.close(); } catch (e) { /* 継続 */ }
+  }
+}
+
+let lastSnapshotAt = 0;
+/** persist()のたびに呼んでよい。30分に1回までしか実際には保存しない。 */
+export function maybeSnapshot(state, now = Date.now()) {
+  if (now - lastSnapshotAt < SNAP_THROTTLE_MS) return Promise.resolve(false);
+  // 空の状態では間隔を消費しない（消えた直後の空データの保存呼び出しが、
+  // 復元後の最初の本物のバックアップを30分間ブロックしてしまうのを避ける）。
+  if (!state || (state.tasks.length === 0 && state.history.length === 0)) return Promise.resolve(false);
+  lastSnapshotAt = now;
+  return saveSnapshot(state, dateStrOf(new Date(now)));
+}
+
+/**
+ * 最新のバックアップを正規化済みのstateとして返す。無い/読めない場合はnull。
+ * 読めない世代があれば、ひとつ前の世代へさかのぼる。
+ */
+export async function loadLatestSnapshot() {
+  const db = await openSnapDb();
+  if (!db) return null;
+  try {
+    const store = db.transaction(SNAP_STORE, 'readonly').objectStore(SNAP_STORE);
+    const keys = (await idbRequest(store.getAllKeys())).sort().reverse();
+    for (const key of keys) {
+      try {
+        const rec = await idbRequest(store.get(key));
+        const data = JSON.parse(rec.json);
+        if (data && Array.isArray(data.tasks)) {
+          return normalizeState({ tasks: data.tasks, history: data.history, stats: data.stats, settings: data.settings });
+        }
+      } catch (e) { /* この世代は読めないので次へ */ }
+    }
+    return null;
+  } catch (e) {
+    return null;
+  } finally {
+    try { db.close(); } catch (e) { /* 継続 */ }
+  }
 }

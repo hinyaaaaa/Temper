@@ -163,7 +163,11 @@ function fuzzSingleDay(rng, iterations) {
       const items = restCandidates.map((t) => {
         const du = (t.type === 'weekly' || !t.deadline) ? Infinity : daysBetween(t.deadline, todayStr);
         const deadlineScore = du === Infinity ? 0 : Math.max(0, 60 - du * 3);
-        const value = Math.max(0.01, deadlineScore + 1); // weekdayBonus=0（統計未指定）
+        // weekdayBonus=0（統計未指定）、timeBonus=0（timeOfDay未指定）、
+        // pressureBonus=0（capacityForDate未指定）。時期補正（締切からの逆算）だけは
+        // 常に効くため、Plannerと同じ公開関数で算出して突き合わせる。
+        const pattern = t.pattern || Planner.estimatePattern(t.title, t.description, []);
+        const value = Math.max(0.01, deadlineScore + Planner.deadlinePhaseBonus(pattern, du) + 1);
         return { load: Math.max(1, Math.round(t.load || 1)), value, id: t.id };
       });
       const bruteBest = bruteForceKnapsack(items, remainingCap);
@@ -636,6 +640,208 @@ function testCompletionUndoDoesNotAccumulate() {
   console.log('  完了/取り消しの繰り返しテストを実行（単発20回・週次20回・過去日完了1件）');
 }
 
+// ------------------------------------------------------------
+// PART H: ALGORITHM_IMPROVEMENT_PLAN §0/§1/§3 の回帰テスト
+// ------------------------------------------------------------
+function testErgonomicsFeatures() {
+  // --- §0: recordMissedOccurrencesUntilToday ---
+  {
+    const weekday = new Date('2026-09-10T00:00:00').getDay();
+    let state = Store.normalizeState({
+      tasks: [{
+        id: 'w', title: '週次', type: 'weekly', weekDays: [weekday], load: 2,
+        doneDates: [], createdAt: new Date('2026-09-01T00:00:00').getTime(), pattern: 'memorization',
+      }],
+      history: [], settings: {}, stats: {},
+    });
+    state.stats.lastMissCheckDate = '2026-09-08';
+    Store.recordMissedOccurrencesUntilToday(state, '2026-09-15');
+    const wp = state.stats.weekdayPattern[`${weekday}:memorization`];
+    assert(wp && wp.missed === 1, '[ergonomics-miss] 対象曜日を未完了のまま通過した週次タスクがmissedとして記録されない', { wp });
+    assert(state.stats.lastMissCheckDate === '2026-09-15', '[ergonomics-miss] lastMissCheckDateが今日に更新されない', { d: state.stats.lastMissCheckDate });
+
+    // 冪等性: 同じtodayStrで再度呼んでも増えない
+    const before = JSON.stringify(state.stats.weekdayPattern);
+    Store.recordMissedOccurrencesUntilToday(state, '2026-09-15');
+    assert(JSON.stringify(state.stats.weekdayPattern) === before, '[ergonomics-miss] 同日に2回呼ぶとmissedが重複加算される（冪等性違反）', { after: state.stats.weekdayPattern });
+
+    // 完了済みの日はmissedにならない
+    let state2 = Store.normalizeState({
+      tasks: [{
+        id: 'w2', title: '週次2', type: 'weekly', weekDays: [weekday], load: 2,
+        doneDates: ['2026-09-10'], createdAt: new Date('2026-09-01T00:00:00').getTime(), pattern: 'memorization',
+      }],
+      history: [], settings: {}, stats: {},
+    });
+    state2.stats.lastMissCheckDate = '2026-09-08';
+    Store.recordMissedOccurrencesUntilToday(state2, '2026-09-15');
+    assert(!state2.stats.weekdayPattern[`${weekday}:memorization`], '[ergonomics-miss] doneDatesに入っている日がmissed扱いされた', { wp: state2.stats.weekdayPattern });
+  }
+  {
+    // lastMissCheckDateがnull（導入前の既存データ）の場合は過去に遡って
+    // ペナルティを課さず、今日を起点に記録を始めるだけ。
+    let state = Store.normalizeState({ tasks: [], history: [], settings: {}, stats: {} });
+    assert(state.stats.lastMissCheckDate === null, '[ergonomics-miss] 初期状態のlastMissCheckDateがnullでない', { d: state.stats.lastMissCheckDate });
+    Store.recordMissedOccurrencesUntilToday(state, '2026-09-15');
+    assert(Object.keys(state.stats.weekdayPattern).length === 0, '[ergonomics-miss] 初回呼び出しで過去に遡ってmissedが記録された（既存ユーザーへの不当なペナルティ）', { wp: state.stats.weekdayPattern });
+    assert(state.stats.lastMissCheckDate === '2026-09-15', '[ergonomics-miss] 初回呼び出し後にlastMissCheckDateが今日にセットされない', { d: state.stats.lastMissCheckDate });
+  }
+
+  // --- §1: 時間帯補正が実際に選定を左右する ---
+  {
+    const today = '2026-09-27';
+    const tasks = [
+      { id: 'ps', title: '思考タスク', load: 3, type: 'once', deadline: null, pattern: 'problem_solving' },
+      { id: 'mem', title: '暗記タスク', load: 3, type: 'once', deadline: null, pattern: 'memorization' },
+    ];
+    // 容量3（どちらか1件しか入らない）で、昼は思考系、夜は暗記系が選ばれるべき。
+    const dayPlan = Planner.buildTodayPlan({ tasks, todayStr: today, baseCapacity: 3, timeOfDay: 'day' });
+    const nightPlan = Planner.buildTodayPlan({ tasks, todayStr: today, baseCapacity: 3, timeOfDay: 'night' });
+    assert(dayPlan.entries.length === 1 && dayPlan.entries[0].id === 'ps', '[ergonomics-time] 日中に思考系タスクが優先選定されない', { picked: dayPlan.entries.map((e) => e.id) });
+    assert(nightPlan.entries.length === 1 && nightPlan.entries[0].id === 'mem', '[ergonomics-time] 夜間に暗記系タスクが優先選定されない', { picked: nightPlan.entries.map((e) => e.id) });
+    // timeOfDay省略時は従来通り時間帯補正なし（後方互換）
+    const noTimePlan = Planner.buildTodayPlan({ tasks, todayStr: today, baseCapacity: 3 });
+    assert(noTimePlan.entries.length === 1, '[ergonomics-time] timeOfDay省略時にbuildTodayPlanが壊れる', { picked: noTimePlan.entries.map((e) => e.id) });
+
+    // explainSelectionが時間帯要因を説明に反映する
+    const reason = Planner.explainSelection(dayPlan.entries[0]);
+    assert(typeof reason === 'string' && reason.length > 0, '[ergonomics-time] 時間帯が決め手のentryでexplainSelectionが空文字を返す', { reason });
+  }
+
+  // --- §3: セッションの起伏（最初の1件は低Load寄り） ---
+  {
+    const today = '2026-09-27';
+    // 全タスクを同一Patternにして、Pattern連続回避による並べ替えの
+    // 影響を排除し、純粋にLoadによるタイブレークだけを見る。
+    const tasks = [
+      { id: 'heavy1', title: '重い1', load: 6, type: 'once', deadline: null, pattern: 'reading' },
+      { id: 'heavy2', title: '重い2', load: 6, type: 'once', deadline: null, pattern: 'reading' },
+      { id: 'light', title: '軽い', load: 1, type: 'once', deadline: null, pattern: 'reading' },
+    ];
+    const plan = Planner.buildTodayPlan({ tasks, todayStr: today, baseCapacity: 20 });
+    assert(plan.entries.length === 3, '[ergonomics-shape] 起伏テスト用タスクが全件選定されない（前提条件が崩れている）', { picked: plan.entries.map((e) => e.id) });
+    assert(plan.entries[0].id === 'light', '[ergonomics-shape] 同Pattern内で最初に選ばれるのが最軽量のタスクでない（ウォームアップの意図）', { order: plan.entries.map((e) => e.id) });
+  }
+
+  console.log('  recordMissedOccurrencesUntilToday / 時間帯補正 / セッションの起伏 を検証');
+}
+
+// ------------------------------------------------------------
+// PART I: 受験向け ②締切逆算の時期補正 ③間に合い具合による前倒し
+//         ⑤自動バックアップ（純粋ロジック・保存の健全性） ⑥完了時刻の学習
+// ------------------------------------------------------------
+function testExamFeatures() {
+  const today = '2026-10-05';
+  const addD = (n) => { const d = new Date(today + 'T00:00:00'); d.setDate(d.getDate() + n); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
+
+  // --- ② 時期補正 ---
+  assert(Planner.deadlinePhaseOf(30) === 'early' && Planner.deadlinePhaseOf(14) === 'mid' && Planner.deadlinePhaseOf(5) === 'mid' && Planner.deadlinePhaseOf(4) === 'late' && Planner.deadlinePhaseOf(1) === 'late', '[exam-phase] 時期の境界が想定と違う', {});
+  assert(Planner.deadlinePhaseOf(0) === null && Planner.deadlinePhaseOf(-3) === null && Planner.deadlinePhaseOf(Infinity) === null, '[exam-phase] 締切なし/当日以降は時期なしになる', {});
+  assert(Planner.deadlinePhaseBonus('memorization', 30) > 0 && Planner.deadlinePhaseBonus('simulation', 30) === 0, '[exam-phase] 遠い締切で記憶系が優先されない', {});
+  assert(Planner.deadlinePhaseBonus('simulation', 3) > Planner.deadlinePhaseBonus('memorization', 3), '[exam-phase] 近い締切で実戦系が記憶系より優先されない', {});
+  {
+    // 同じ締切(30日後)・同じLoadの記憶系と実戦系を容量1枠で競わせると、記憶系が選ばれる
+    const tasks = [
+      { id: 'sim', title: '模試', load: 3, type: 'once', deadline: addD(30), pattern: 'simulation' },
+      { id: 'mem', title: '単語', load: 3, type: 'once', deadline: addD(30), pattern: 'memorization' },
+    ];
+    const plan = Planner.buildTodayPlan({ tasks, todayStr: today, baseCapacity: 3 });
+    assert(plan.entries.length === 1 && plan.entries[0].id === 'mem', '[exam-phase] 締切まで遠い時期に記憶系が選ばれない', { picked: plan.entries.map((e) => e.id) });
+    assert(/土台/.test(Planner.explainSelection(plan.entries[0])), '[exam-phase] 時期が決め手の選定理由が説明に反映されない', { r: Planner.explainSelection(plan.entries[0]) });
+    const tasks2 = tasks.map((t) => ({ ...t, deadline: addD(3) }));
+    const plan2 = Planner.buildTodayPlan({ tasks: tasks2, todayStr: today, baseCapacity: 3 });
+    assert(plan2.entries.length === 1 && plan2.entries[0].id === 'sim', '[exam-phase] 締切が近い時期に実戦系が選ばれない', { picked: plan2.entries.map((e) => e.id) });
+  }
+
+  // --- ③ 間に合い具合 ---
+  const capFn = () => 3;
+  {
+    const heavy = Array.from({ length: 40 }, (_, i) => ({ id: 'f' + i, title: '章' + i, load: 3, type: 'once', deadline: addD(30), pattern: 'reading' }));
+    const m = Planner.computeDeadlinePressure({ tasks: heavy, todayStr: today, capacityForDate: capFn });
+    assert(m.size === 40 && [...m.values()].every((r) => r > 1.2 && r < 1.4), '[exam-pressure] 容量93に対し必要120の窓のratioが約1.29にならない', { r: [...m.values()][0] });
+    const light = heavy.slice(0, 10);
+    const m2 = Planner.computeDeadlinePressure({ tasks: light, todayStr: today, capacityForDate: capFn });
+    assert([...m2.values()].every((r) => r < 0.8), '[exam-pressure] 余裕のある窓でratioが0.8以上になる', { r: [...m2.values()][0] });
+    assert(Planner.pressureBonusOf(0.8) === 0 && Planner.pressureBonusOf(1.0) > 0 && Planner.pressureBonusOf(99) === 25, '[exam-pressure] 加点の下限/上限が想定と違う', {});
+
+    // 逼迫している窓の far-deadline タスクが、期限なしタスクより前倒しで選ばれる
+    const n = { id: 'n', title: '期限なし', load: 3, type: 'once', deadline: null, pattern: 'reading' };
+    const withPressure = Planner.buildTodayPlan({ tasks: [n, ...heavy], todayStr: today, baseCapacity: 3, capacityForDate: capFn });
+    assert(withPressure.entries.length === 1 && withPressure.entries[0].id.startsWith('f'), '[exam-pressure] 逼迫した締切のタスクが前倒しで選ばれない', { picked: withPressure.entries.map((e) => e.id) });
+    assert(/前倒し/.test(Planner.explainSelection(withPressure.entries[0])), '[exam-pressure] 前倒しが決め手の選定理由が説明に反映されない', { r: Planner.explainSelection(withPressure.entries[0]) });
+    const noCap = Planner.buildTodayPlan({ tasks: [n, ...heavy], todayStr: today, baseCapacity: 3 });
+    assert(noCap.entries.every((e) => e.pressureBonus == null || e.pressureBonus === 0), '[exam-pressure] capacityForDate省略時に圧力が効いている（後方互換違反）', {});
+
+    // 遅れた分は窓に残り続け、自動で圧力が増す（やれなかった日を責めずに組み直す）
+    const ontime = Planner.computeDeadlinePressure({ tasks: heavy.slice(0, 25), todayStr: today, capacityForDate: capFn });
+    const later = Planner.computeDeadlinePressure({ tasks: heavy.slice(0, 25), todayStr: addD(10), capacityForDate: capFn });
+    assert([...later.values()][0] > [...ontime.values()][0], '[exam-pressure] 同じ残タスクで日が進んでも圧力が増えない', { a: [...ontime.values()][0], b: [...later.values()][0] });
+    // 期限超過分は今日の窓に入り、完了済み・週次は対象外
+    const od = Planner.computeDeadlinePressure({ tasks: [{ id: 'o', load: 6, type: 'once', deadline: addD(-2) }, { id: 'd', load: 6, type: 'once', deadline: addD(-2), done: true }, { id: 'w', load: 6, type: 'weekly', weekDays: [0], deadline: addD(3) }], todayStr: today, capacityForDate: capFn });
+    assert(od.size === 1 && od.get('o') >= 2, '[exam-pressure] 期限超過/完了済み/週次の扱いが想定と違う', { od: [...od.entries()] });
+    // capacityForDateが壊れた値を返してもクラッシュしない
+    Planner.computeDeadlinePressure({ tasks: heavy, todayStr: today, capacityForDate: () => NaN });
+    Planner.computeDeadlinePressure({ tasks: heavy, todayStr: today, capacityForDate: () => { return -5; } });
+  }
+
+  // --- ⑥ 完了時刻の学習 ---
+  {
+    const bucketOf = (d) => { const h = d.getHours(); return h >= 5 && h < 10 ? 'dawn' : h >= 10 && h < 16 ? 'day' : h >= 16 && h < 19 ? 'dusk' : 'night'; };
+    const at = (hour, i) => new Date(2026, 8, 1 + (i % 25), hour, 0, 0).getTime();
+    const mk = (n, hour, pattern, startIdx = 0) => Array.from({ length: n }, (_, i) => ({ taskId: 't' + pattern + i, event: 'completed', pattern, ts: at(hour, startIdx + i), date: '2026-09-01', load: 2 }));
+    // 暗記は夜にばかり、思考は日中にばかり完了している
+    const state = Store.normalizeState({ tasks: [], history: [...mk(15, 22, 'memorization'), ...mk(15, 11, 'problem_solving')], settings: {}, stats: {} });
+    const stats = Store.deriveTimeOfDayPatternStats(state, { bucketOf });
+    assert(stats.total.all === 30 && stats.byPattern.memorization.night === 15 && stats.byPattern.problem_solving.day === 15, '[exam-time] 完了時刻の集計が合わない', { stats });
+    const aff = Planner.observedTimeAffinity('memorization', 'night', stats);
+    assert(aff && aff.bonus > 0 && aff.weight === 0.5, '[exam-time] 夜に偏って完了する暗記の夜の相性が正にならない', { aff });
+    const affDay = Planner.observedTimeAffinity('memorization', 'day', stats);
+    assert(affDay && affDay.bonus < 0, '[exam-time] 夜型の暗記の日中の相性が負にならない', { affDay });
+    // 件数不足ではnull→一般モデルのみ
+    const small = Store.normalizeState({ tasks: [], history: mk(5, 22, 'memorization'), settings: {}, stats: {} });
+    assert(Planner.observedTimeAffinity('memorization', 'night', Store.deriveTimeOfDayPatternStats(small, { bucketOf })) === null, '[exam-time] 件数不足でも実績補正が効く', {});
+    assert(Planner.timeOfDayPatternBonus('memorization', 'night', null) === 1.5, '[exam-time] 実績なしで一般モデルの値にならない', {});
+    // 一般モデルでは日中に有利な思考系も、夜にしか進めてこなかった人の昼は下がる
+    const nightOwl = Store.normalizeState({ tasks: [], history: [...mk(20, 23, 'problem_solving'), ...mk(15, 11, 'memorization')], settings: {}, stats: {} });
+    const nStats = Store.deriveTimeOfDayPatternStats(nightOwl, { bucketOf });
+    assert(Planner.timeOfDayPatternBonus('problem_solving', 'day', nStats) < Planner.timeOfDayPatternBonus('problem_solving', 'day', null), '[exam-time] 夜にしか完了してこなかった人の昼の思考系が一般モデルより下がらない', {});
+    // 取り消し・不正データ・タスク削除済みでもクラッシュしない
+    const weird = Store.normalizeState({ tasks: [{ id: 'x', title: '英単語暗記' }], history: [{ event: 'completed', ts: 'abc' }, { event: 'completed', taskId: 'x', ts: at(22, 0) }, null, { event: 'missed' }], settings: {}, stats: {} });
+    const wStats = Store.deriveTimeOfDayPatternStats(weird, { bucketOf, estimatePattern: (t) => Planner.estimatePatternGeneral(t.title, t.description) });
+    assert(wStats.total.all === 1, '[exam-time] 不正なhistoryの扱いが想定と違う', { wStats });
+    Store.deriveTimeOfDayPatternStats(weird); // bucketOf未指定でも落ちない
+  }
+
+  // --- ⑤ バックアップ世代の整理・保存データの健全性 ---
+  {
+    const days = Array.from({ length: 120 }, (_, i) => addD(-i));
+    const keep = Store.selectSnapshotsToKeep(days, today);
+    assert(days.slice(0, 14).every((d) => keep.has(d)), '[exam-backup] 直近14日が残らない', {});
+    assert(!keep.has(addD(-14 - 12 * 7)) && !keep.has(addD(-119)), '[exam-backup] 12週より古い世代が残っている', {});
+    const olds = [...keep].filter((d) => d < addD(-13));
+    const weeks = new Set(olds.map((d) => { const x = new Date(d + 'T00:00:00'); x.setDate(x.getDate() - ((x.getDay() + 6) % 7)); return x.toDateString(); }));
+    assert(olds.length === weeks.size && olds.length >= 10 && olds.length <= 13, '[exam-backup] 古い世代が週ごと1件になっていない', { olds: olds.length, weeks: weeks.size });
+    assert(Store.selectSnapshotsToKeep([addD(2)], today).has(addD(2)), '[exam-backup] 未来日付の世代を消そうとする（時計ずれ）', {});
+    assert(Store.selectSnapshotsToKeep([], today).size === 0, '[exam-backup] 空入力で落ちる/残る', {});
+  }
+  {
+    // localStorageが「消えた」「壊れた」「正常」のときのloadStateの判定
+    const mem = new Map();
+    globalThis.localStorage = { getItem: (k) => (mem.has(k) ? mem.get(k) : null), setItem: (k, v) => { mem.set(k, String(v)); }, removeItem: (k) => { mem.delete(k); } };
+    Store.loadState();
+    assert(Store.getLoadInfo().lost === true && Store.getLoadInfo().reason === 'missing', '[exam-backup] 保存データなしがlostにならない', { i: Store.getLoadInfo() });
+    mem.set('temper_data_v1', '{broken json');
+    const st = Store.loadState();
+    assert(Store.getLoadInfo().reason === 'corrupt' && mem.get('temper_data_v1_corrupt') === '{broken json', '[exam-backup] 壊れた保存データが退避されない', { i: Store.getLoadInfo() });
+    assert(Array.isArray(st.tasks) && st.tasks.length === 0, '[exam-backup] 壊れた場合に初期状態で起動しない', {});
+    mem.set('temper_data_v1', JSON.stringify({ tasks: [{ id: 'a', title: 'x', load: 2, type: 'once' }], history: [] }));
+    const ok = Store.loadState();
+    assert(Store.getLoadInfo().lost === false && ok.tasks.length === 1, '[exam-backup] 正常な保存データがlost扱いになる', { i: Store.getLoadInfo() });
+    delete globalThis.localStorage;
+  }
+
+  console.log('  締切逆算の時期補正 / 間に合い具合 / 完了時刻の学習 / バックアップ整理・保存の健全性 を検証');
+}
 
 console.log('=== PART A: buildTodayPlan 単日ファジング ===');
 for (const seed of [12345, 777, 2026, 999999, 42]) fuzzSingleDay(mulberry32(seed), 3000);
@@ -668,6 +874,12 @@ testScale();
 
 console.log('=== PART G: 完了/取り消しの繰り返しでhistoryが積み重ならないか ===');
 testCompletionUndoDoesNotAccumulate();
+
+console.log('=== PART H: 人間工学・心理学ベースの改修（missed記録・時間帯補正・セッションの起伏） ===');
+testErgonomicsFeatures();
+
+console.log('=== PART I: 受験向け（時期補正・間に合い具合・完了時刻の学習・自動バックアップ） ===');
+testExamFeatures();
 
 console.log('\n=== 結果 ===');
 console.log(`総アサーション数: ${assertionCount}`);

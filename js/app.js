@@ -22,14 +22,19 @@ let weatherState = null;   // { condition, temperature, source } | null（取得
 let pendingImport = null;  // インポート確認中のデータ
 
 /** 設定タブに小さく表示するだけの表示用バージョン。改修のたびに上げる。 */
-const APP_VERSION = 'v1.6.1';
+const APP_VERSION = 'v1.7.0';
 
 const todayStr = () => {
   const d = new Date();
   return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
 };
 
-function persist() { Store.saveState(state); }
+function persist() {
+  Store.saveState(state);
+  // 日次の世代バックアップ（IndexedDB）。30分に1回までしか実際には動かず、
+  // 失敗しても主機能には影響しない（憲法11条）。
+  Store.maybeSnapshot(state).catch(() => {});
+}
 
 /**
  * 今日という日付の時点で完了しているタスクのLoad合計。
@@ -63,6 +68,12 @@ function recomputeTodayPlan() {
     baseCapacity: Store.getCapacityFor(state, today),
     weekdayStats: Store.deriveWeekdayStats(state),
     weekdayPatternStats: Store.deriveWeekdayPatternStats(state),
+    timeOfDay: Weather.getTimeOfDay(),
+    timeOfDayPatternStats: Store.deriveTimeOfDayPatternStats(state, {
+      bucketOf: Weather.getTimeOfDay,
+      estimatePattern: (t) => Planner.estimatePatternGeneral(t.title, t.description),
+    }),
+    capacityForDate: (dateStr) => Store.getCapacityFor(state, dateStr),
     patternHistory: Store.derivePatternHistory(state),
     alreadyDoneLoad: computeDoneLoadToday(today),
   });
@@ -85,7 +96,15 @@ function recomputeTodayPlan() {
  */
 function ensureTodayPlanFresh() {
   const today = todayStr();
-  if (currentPlanDate !== today) recomputeTodayPlan();
+  if (currentPlanDate !== today) {
+    // 日付が変わった時点で、前回チェック以降に「対象曜日だったのに
+    // 完了しなかった」週次タスクをmissedとして記録する（ALGORITHM_
+    // IMPROVEMENT_PLAN §0）。recomputeTodayPlan()より前に行うことで、
+    // 今回の再計算がこのmissedを反映した曜日×Pattern統計を使える。
+    Store.recordMissedOccurrencesUntilToday(state, today);
+    persist();
+    recomputeTodayPlan();
+  }
 }
 
 /* ------------------------------------------------------------
@@ -1048,6 +1067,29 @@ function updateFab() {
 /* ------------------------------------------------------------
    起動
    ------------------------------------------------------------ */
+/**
+ * 保存データが消えていた/壊れていた場合に、自動バックアップから戻す（⑤）。
+ * 待っている間にユーザーが何か入力していたら、その内容を優先して上書きしない。
+ */
+async function restoreFromBackupIfLost() {
+  if (!Store.getLoadInfo().lost) return;
+  const snap = await Store.loadLatestSnapshot();
+  if (!snap) return;
+  if (state.tasks.length > 0 || state.history.length > 0) return;
+  state = snap;
+  persist();
+  recomputeTodayPlan();
+  render();
+  showToast('自動バックアップから復元しました');
+}
+
+/** オフラインでも起動できるよう、アプリ本体をキャッシュするservice workerを登録する（⑤）。 */
+function registerOfflineSupport() {
+  try {
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+  } catch (e) { /* 非対応環境（file://等）では何もしない */ }
+}
+
 function init() {
   if (init._ran) return;
   init._ran = true;
@@ -1056,6 +1098,9 @@ function init() {
     applySky();
     render();
     refreshWeather();
+    Store.requestPersistentStorage();
+    registerOfflineSupport();
+    restoreFromBackupIfLost().catch(() => {});
     setInterval(applySky, 5 * 60 * 1000);
     // 何も操作しないままアプリを開きっぱなしで日付をまたいだ場合でも
     // 今日のプランが古いまま残らないよう、1分おきに日付の変化を確認する。

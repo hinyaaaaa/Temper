@@ -193,6 +193,109 @@ function weekdayPatternBonus(pattern, weekday, weekdayPatternStats) {
 }
 
 /* ------------------------------------------------------------
+   時間帯補正（ALGORITHM_IMPROVEMENT_PLAN §1）
+   ------------------------------------------------------------
+   人間工学・睡眠科学の一般的な知見（一般モデル、§17）:
+     - 深い思考を要するPattern（思考・応用・実戦）は覚醒度の高い時間帯
+       （多くの人にとって午前〜日中）に取り組みやすい。
+     - 暗記系（記憶）は覚醒度への依存が比較的弱く、かつ就寝前に近い
+       時間帯は睡眠中の記憶定着と相性が良いとされる。
+   これらは万人に当てはまる断定ではなく「初期値として妥当な一般モデル」
+   に過ぎないため、値は小さく抑える。ユーザーの自己入力（朝型/夜型の
+   申告など）は一切使わない（HANDOFF §14）。時間帯そのものはweather.jsの
+   getTimeOfDay()と同じ 'dawn'|'day'|'dusk'|'night' の4区分を再利用し、
+   UIと同じ語彙で一貫させる。
+   ------------------------------------------------------------ */
+const TIME_PATTERN_AFFINITY = {
+  dawn: { [PATTERNS.PROBLEM_SOLVING]: 1, [PATTERNS.ADVANCED_PRACTICE]: 0.5 },
+  day: {
+    [PATTERNS.PROBLEM_SOLVING]: 1.5, [PATTERNS.ADVANCED_PRACTICE]: 1.5,
+    [PATTERNS.SIMULATION]: 1.5, [PATTERNS.PRACTICE]: 0.5,
+  },
+  dusk: { [PATTERNS.REINFORCEMENT]: 0.5, [PATTERNS.PRACTICE]: 0.5 },
+  night: { [PATTERNS.MEMORIZATION]: 1.5, [PATTERNS.REINFORCEMENT]: 0.5 },
+};
+
+/**
+ * 実績（完了した時刻の履歴）から見た、そのPatternとその時間帯の相性。
+ * ------------------------------------------------------------
+ * 自己申告を使わず、ユーザー自身の完了時刻だけから個人差を学習する
+ * （HANDOFF §14: 自己入力を要する機能は実装しない）。
+ *
+ * lift = 「そのPatternがその時間帯に完了された割合」÷「全タスクがその時間帯に
+ * 完了された割合」。1より大きければ、そのPatternは普段その時間帯に進めやすい。
+ * 件数が少ないうちは割合が暴れるため、ラプラス平滑化と最小件数
+ * （Pattern単位8件・全体20件）で保護し、件数が増えるほど信頼度（weight）を
+ * 上げて一般モデルから実績へ重みを移す。
+ *
+ * 注意: これは「できた時刻」であって「向いている時刻」ではなく、Planner自身が
+ * 選んだ時間帯に完了が偏る自己強化の面がある。そのため上限を小さく抑える。
+ *
+ * @param {{total:object, byPattern:object}|null} stats Store.deriveTimeOfDayPatternStats()の結果
+ * @returns {{bonus:number, weight:number}|null} 件数不足ならnull
+ */
+export function observedTimeAffinity(pattern, timeOfDay, stats) {
+  if (!stats || !stats.total || !stats.byPattern || !timeOfDay) return null;
+  const p = stats.byPattern[pattern];
+  const t = stats.total;
+  if (!p || p.all < 8 || t.all < 20) return null;
+  const shareP = ((p[timeOfDay] || 0) + 1) / (p.all + 4);
+  const shareAll = ((t[timeOfDay] || 0) + 1) / (t.all + 4);
+  const lift = shareP / shareAll;
+  const bonus = Math.max(-1.5, Math.min(3, (lift - 1) * 2));
+  const weight = Math.min(1, p.all / 30);
+  return { bonus, weight };
+}
+
+/**
+ * @param {string} pattern
+ * @param {string|null} timeOfDay 'dawn'|'day'|'dusk'|'night'（weather.jsのgetTimeOfDay()と同じ区分）
+ * @param {object|null} observedStats 完了時刻の実績。無ければ一般モデルのみ
+ * @returns {number} 一般モデルと実績を、実績の件数に応じた重みでブレンドした加点
+ */
+export function timeOfDayPatternBonus(pattern, timeOfDay, observedStats = null) {
+  if (!timeOfDay) return 0;
+  const general = (TIME_PATTERN_AFFINITY[timeOfDay] && TIME_PATTERN_AFFINITY[timeOfDay][pattern]) || 0;
+  const obs = observedTimeAffinity(pattern, timeOfDay, observedStats);
+  if (!obs) return general;
+  return general * (1 - obs.weight) + obs.bonus * obs.weight;
+}
+
+/* ------------------------------------------------------------
+   締切からの逆算による時期の補正（ALGORITHM_IMPROVEMENT_PLAN 受験向け②）
+   ------------------------------------------------------------
+   締切（試験日など）まで遠い間は記憶・読解を、中盤は定着・演習・思考を、
+   近づいたら演習・応用・実戦を、わずかに優先する。締切は登録済みの情報
+   なので追加入力は要らない。週次タスクはシリーズの終了日が締切では
+   ないため対象外（_daysUntil が Infinity）。値は小さく抑え、締切そのものの
+   近さ（deadlineScore）を覆さない。
+   ------------------------------------------------------------ */
+const PHASE_AFFINITY = {
+  early: { [PATTERNS.MEMORIZATION]: 1.5, [PATTERNS.READING]: 1, [PATTERNS.REINFORCEMENT]: 0.5 },
+  mid: {
+    [PATTERNS.REINFORCEMENT]: 1, [PATTERNS.PRACTICE]: 1,
+    [PATTERNS.PROBLEM_SOLVING]: 1, [PATTERNS.WRITING]: 0.5,
+  },
+  late: {
+    [PATTERNS.PRACTICE]: 1.5, [PATTERNS.ADVANCED_PRACTICE]: 1.5,
+    [PATTERNS.SIMULATION]: 2, [PATTERNS.WRITING]: 1,
+  },
+};
+
+/** @returns {'early'|'mid'|'late'|null} 締切までの日数から見た時期。締切なし/当日以降はnull */
+export function deadlinePhaseOf(daysUntilDeadline) {
+  if (!Number.isFinite(daysUntilDeadline) || daysUntilDeadline < 1) return null;
+  if (daysUntilDeadline >= 15) return 'early';
+  if (daysUntilDeadline >= 5) return 'mid';
+  return 'late';
+}
+
+export function deadlinePhaseBonus(pattern, daysUntilDeadline) {
+  const phase = deadlinePhaseOf(daysUntilDeadline);
+  return phase ? (PHASE_AFFINITY[phase][pattern] || 0) : 0;
+}
+
+/* ------------------------------------------------------------
    候補生成（§9）
    ------------------------------------------------------------
    §4「繰り返し」に対応する。単発(once)タスクは done フラグで
@@ -265,6 +368,9 @@ const OVERDUE_MUST_INCLUDE = true; // §14: 期限が非常に近いタスクは
  * @param {number} args.baseCapacity ユーザー設定の1日容量
  * @param {object} [args.weekdayStats] Capacity補正用の曜日別実績
  * @param {object} [args.weekdayPatternStats] 曜日×Pattern補正用の実績
+ * @param {string|null} [args.timeOfDay] 'dawn'|'day'|'dusk'|'night'。省略時は時間帯補正なし
+ * @param {object|null} [args.timeOfDayPatternStats] 完了時刻の実績（Store.deriveTimeOfDayPatternStats）。省略時は一般モデルのみ
+ * @param {(dateStr:string)=>number} [args.capacityForDate] 日ごとの容量。渡すと締切への間に合い具合（computeDeadlinePressure）による前倒しが効く。省略時は無効
  * @param {Array} [args.patternHistory] Pattern個人補正用の完了/登録履歴 [{title, pattern}]
  * @param {number} [args.alreadyDoneLoad] 今日すでに完了した分のLoad合計（省略時0）。
  *   今日の残り選定が「まだ使っていない容量」の中で行われるようにするための
@@ -284,6 +390,9 @@ export function buildTodayPlan({
   baseCapacity,
   weekdayStats = null,
   weekdayPatternStats = null,
+  timeOfDay = null,
+  timeOfDayPatternStats = null,
+  capacityForDate = null,
   patternHistory = [],
   alreadyDoneLoad = 0,
 }) {
@@ -354,15 +463,28 @@ export function buildTodayPlan({
   // （候補数が小さい実用範囲を前提とした軽量なナップサック法）。
   // 同じ達成価値なら「件数が多い組み合わせ」を優先し、無駄な容量の
   // 使い残しを避ける。
+  // 締切への間に合い具合（capacityForDateが渡された時だけ有効）。
+  // 期限まで遠く deadlineScore が0でも、窓全体が容量に対して重い場合は
+  // 前倒しで進めるよう価値を上げる（受験向け③）。
+  const pressureById = capacityForDate
+    ? computeDeadlinePressure({ tasks, todayStr, capacityForDate, weekdayStats, alreadyDoneLoad: doneLoadSafe })
+    : new Map();
+
   const scored = rest.map((t) => {
     const deadlineScore = t._daysUntil === Infinity ? 0 : Math.max(0, 60 - t._daysUntil * 3);
     const weekdayBonus = weekdayPatternBonus(t._pattern, weekday, weekdayPatternStats);
-    return { task: t, deadlineScore, weekdayBonus, value: Math.max(0.01, deadlineScore + weekdayBonus + 1) }; // +1: 期限なしタスクにも僅かな基礎価値を与える
+    const timeBonus = timeOfDayPatternBonus(t._pattern, timeOfDay, timeOfDayPatternStats);
+    const phaseBonus = deadlinePhaseBonus(t._pattern, t._daysUntil);
+    const pressureBonus = pressureBonusOf(pressureById.get(t.id));
+    return {
+      task: t, deadlineScore, weekdayBonus, timeBonus, phaseBonus, pressureBonus,
+      value: Math.max(0.01, deadlineScore + weekdayBonus + timeBonus + phaseBonus + pressureBonus + 1), // +1: 期限なしタスクにも僅かな基礎価値を与える
+    };
   });
   // 選定理由の説明（explainSelection）が実際の判断根拠を正確に言い表せる
-  // よう、taskごとのdeadlineScore/weekdayBonusを引けるようにしておく。
+  // よう、taskごとのdeadlineScore/weekdayBonus/timeBonusを引けるようにしておく。
   // knapsackSelect自体はtask本体しか返さないため、このMapを経由する。
-  const scoreInfoById = new Map(scored.map((s) => [s.task.id, { deadlineScore: s.deadlineScore, weekdayBonus: s.weekdayBonus }]));
+  const scoreInfoById = new Map(scored.map((s) => [s.task.id, { deadlineScore: s.deadlineScore, weekdayBonus: s.weekdayBonus, timeBonus: s.timeBonus, phaseBonus: s.phaseBonus, pressureBonus: s.pressureBonus, phase: deadlinePhaseOf(s.task._daysUntil) }]));
 
   const remainingCapacity = Math.max(0, effectiveCapacity - usedLoad);
   const chosenSet = knapsackSelect(scored, remainingCapacity);
@@ -515,10 +637,24 @@ function orderToAvoidRuns(tasks, initialLastPattern) {
 
     // 選ばれたグループ内では、直前のLoadと相性の良い（loadRunPenaltyが
     // 小さい）ものを優先して取り出す（同一Pattern内でのLoad偏り回避）。
+    // 最初の1件・最後の1件は、それに加えて「起伏」のタイブレークを足す
+    // （ALGORITHM_IMPROVEMENT_PLAN §3: ウォームアップ／クールダウン）。
+    // これはPattern連続回避・Load偏り回避という既存の主要な制約を上書き
+    // しない程度の小さい重みに留め、あくまで同グループ内の候補が複数
+    // あるときの最終的な一押しとしてだけ働かせる。
+    const isFirstPick = ordered.length === 0;
+    // remaining===1（＝もう1件しか残っていない）時点では選択の余地が
+    // そもそも無い（その1件を置くしかない）ため、バイアスをかけても
+    // 意味がない。実際に「軽いものを後半に残す」効果を持たせるには、
+    // まだ複数の選択肢が残っている終盤（目安として残り3件以内）の
+    // 時点から効かせる必要がある。
+    const isLastPick = remaining <= 3;
     const group = groups.get(bestKey);
     let pickIdx = 0, pickPenalty = Infinity;
     for (let i = 0; i < group.length; i++) {
-      const p = loadRunPenaltyForValues(lastLoad, safeLoad(group[i].load));
+      const loadVal = safeLoad(group[i].load);
+      let p = loadRunPenaltyForValues(lastLoad, loadVal);
+      if (isFirstPick || isLastPick) p += loadVal * 0.5;
       if (p < pickPenalty) { pickPenalty = p; pickIdx = i; }
     }
     const chosen = group.splice(pickIdx, 1)[0];
@@ -572,6 +708,10 @@ function toEntry(task, src, overCapacity, scoreInfo) {
     // explainSelection()が「本当の決め手」と食い違わないようにする。
     deadlineScore: scoreInfo ? scoreInfo.deadlineScore : null,
     weekdayBonus: scoreInfo ? scoreInfo.weekdayBonus : null,
+    timeBonus: scoreInfo ? scoreInfo.timeBonus : null,
+    phaseBonus: scoreInfo ? scoreInfo.phaseBonus : null,
+    pressureBonus: scoreInfo ? scoreInfo.pressureBonus : null,
+    phase: scoreInfo ? scoreInfo.phase : null,
   };
 }
 
@@ -659,6 +799,90 @@ export function estimateAllTasksFinishDate({
 }
 
 /**
+ * 締切に対する「間に合い具合」を、自動で測る（受験向け③）。
+ * ------------------------------------------------------------
+ * 各締切 D について、「D までに終えるべき未完了の単発Load合計」÷
+ * 「今日から D までに使える容量（週次の先取り分を除く）」を求め、その比を
+ * 締切の窓の逼迫度（ratio）とする。1を超えれば、このままでは窓の中に
+ * 収まらない。各タスクの圧力は「自分の締切以降の窓のratioの最大値」。
+ * 遅れて未完了の分は自動的に窓に残り続けるため、「やれなかった日」を
+ * 咎めることなく、残りの日数と容量から前倒しの強さが組み直される
+ * （評価語は使わず、数値だけを返す。憲法7条）。
+ *
+ * 近似: 解禁日（unlockDate）による着手可能日の制約は考慮しない
+ * （考慮しない側＝実際より余裕があると見積もる側に倒れる）。
+ *
+ * @returns {Map<string, number>} taskId → 圧力ratio（締切を持つ単発の未完了タスクのみ）
+ */
+export function computeDeadlinePressure({
+  tasks,
+  todayStr,
+  capacityForDate,
+  weekdayStats = null,
+  alreadyDoneLoad = 0,
+  maxHorizonDays = 400,
+}) {
+  const out = new Map();
+  if (typeof capacityForDate !== 'function') return out;
+  const items = tasks
+    .filter((t) => t.type !== 'weekly' && !t.done && t.deadline)
+    .map((t) => {
+      let d = t.deadline < todayStr ? todayStr : t.deadline; // 期限超過分は「今日まで」の窓に入れる
+      const span = daysUntil(d, todayStr);
+      if (!Number.isFinite(span)) return null;
+      if (span > maxHorizonDays) d = addDays(todayStr, maxHorizonDays);
+      return { id: t.id, load: safeLoad(t.load), d };
+    })
+    .filter(Boolean);
+  if (items.length === 0) return out;
+
+  const lastD = items.reduce((m, it) => (it.d > m ? it.d : m), todayStr);
+  const horizon = daysUntil(lastD, todayStr);
+
+  // 日ごとの使える容量の累積（avail[i] = 今日〜今日+i日）
+  const avail = [];
+  let acc = 0;
+  for (let i = 0; i <= horizon; i++) {
+    const dateStr = addDays(todayStr, i);
+    const weekday = new Date(dateStr + 'T00:00:00').getDay();
+    const cap = computeEffectiveCapacity(Math.max(0, Number(capacityForDate(dateStr)) || 0), { weekday, weekdayStats });
+    const weeklyLoad = tasks
+      .filter((t) => t.type === 'weekly'
+        && Array.isArray(t.weekDays) && t.weekDays.includes(weekday)
+        && !(t.deadline && dateStr > t.deadline)
+        && (i > 0 || isTaskPendingOn(t, dateStr)))
+      .reduce((sum, t) => sum + safeLoad(t.load), 0);
+    let budget = Math.max(0, cap - weeklyLoad);
+    if (i === 0) budget = Math.max(0, budget - (Number(alreadyDoneLoad) > 0 ? Number(alreadyDoneLoad) : 0));
+    acc += budget;
+    avail.push(acc);
+  }
+
+  // 締切の窓ごとのratio（必要Load累積 ÷ 使える容量累積）
+  const dates = [...new Set(items.map((it) => it.d))].sort();
+  const ratioByDate = new Map();
+  dates.forEach((D) => {
+    const required = items.filter((it) => it.d <= D).reduce((s, it) => s + it.load, 0);
+    const available = avail[daysUntil(D, todayStr)];
+    ratioByDate.set(D, required / Math.max(available, 1));
+  });
+
+  // 各タスクの圧力 = 自分の締切以降の窓のratioの最大値
+  items.forEach((it) => {
+    let worst = 0;
+    dates.forEach((D) => { if (D >= it.d) worst = Math.max(worst, ratioByDate.get(D)); });
+    out.set(it.id, worst);
+  });
+  return out;
+}
+
+/** 圧力ratio → 前倒し加点。0.8未満は0、以降なだらかに増え25で頭打ち。 */
+export function pressureBonusOf(ratio) {
+  if (!Number.isFinite(ratio) || ratio <= 0.8) return 0;
+  return Math.min(25, (ratio - 0.8) * 40);
+}
+
+/**
  * 「今日選ばれた理由」の説明文を組み立てる（§5, §11, §17）。
  * ------------------------------------------------------------
  * 以前は src === 'filled' かつ期限があれば常に「期限が近いため」、
@@ -674,8 +898,9 @@ export function estimateAllTasksFinishDate({
  *     実際にはweekdayBonusの方が選定に効いていることがあり得るのに
  *     「期限が近いため」と言い切っていた。
  * ここでは実際にナップサックの価値計算に使った deadlineScore /
- * weekdayBonus の大小を比較し、どちらが決め手だったかで文言を出し
- * 分ける。
+ * weekdayBonus / timeBonus（時間帯補正、
+ * ALGORITHM_IMPROVEMENT_PLAN §1）の大小を比較し、どちらが決め手
+ * だったかで文言を出し分ける。
  */
 export function explainSelection(entry) {
   const parts = [];
@@ -687,15 +912,28 @@ export function explainSelection(entry) {
     parts.push('毎週この曜日に行うタスクのため');
   } else {
     // 'filled': 実際の価値計算に使った内訳から、決め手になった要因を判定する。
-    const deadlineScore = Number.isFinite(entry.deadlineScore) ? entry.deadlineScore : 0;
-    const weekdayBonus = Number.isFinite(entry.weekdayBonus) ? entry.weekdayBonus : 0;
-    if (deadlineScore > 0 && deadlineScore >= weekdayBonus) {
-      parts.push('期限が近いため');
-    } else if (weekdayBonus > 0) {
-      parts.push('この曜日はこの種の学習が続きやすい実績があるため');
-    } else {
-      parts.push('今日の残り容量を活かして無理なく進められるため');
-    }
+    // 加点が同点の場合は、事実としての切迫度が高い順（期限→間に合い具合→
+    // 時期→曜日実績→時間帯）に採用する。
+    const num = (v) => (Number.isFinite(v) ? v : 0);
+    const deadlineScore = num(entry.deadlineScore);
+    const pressureBonus = num(entry.pressureBonus);
+    const phaseBonus = num(entry.phaseBonus);
+    const weekdayBonus = num(entry.weekdayBonus);
+    const timeBonus = num(entry.timeBonus);
+    const factors = [
+      { v: deadlineScore, text: '期限が近いため' },
+      { v: pressureBonus, text: '締切までの残り容量に対して負荷が大きく、前倒しで進める必要があるため' },
+      { v: phaseBonus, text: entry.phase === 'late'
+        ? '締切が近く、仕上げの段階に向いた学習のため'
+        : entry.phase === 'mid'
+          ? '締切までの中盤に向いた学習のため'
+          : '締切までまだ日数があり、土台づくりに向いた学習のため' },
+      { v: weekdayBonus, text: 'この曜日はこの種の学習が続きやすい実績があるため' },
+      { v: timeBonus, text: '今の時間帯に向いている学習のため' },
+    ];
+    let best = null;
+    factors.forEach((f) => { if (f.v > 0 && (!best || f.v > best.v)) best = f; });
+    parts.push(best ? best.text : '今日の残り容量を活かして無理なく進められるため');
   }
   if (entry.overCapacity) parts.push('容量を超えても今日中に扱う必要があるため');
   return parts.join('、');
