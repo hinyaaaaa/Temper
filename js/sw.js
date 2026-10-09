@@ -11,7 +11,7 @@
    CACHE_NAME は app.js の APP_VERSION と合わせて更新すること
    （古いキャッシュはactivate時に削除される）。
    ============================================================ */
-const CACHE_NAME = 'temper-shell-v1.7.0';
+const CACHE_NAME = 'temper-shell-v1.8.0';
 const SHELL = [
   './',
   './index.html',
@@ -20,6 +20,9 @@ const SHELL = [
   './js/planner.js',
   './js/store.js',
   './js/weather.js',
+  './js/forecast.js',
+  './js/skyrender.js',
+  './js/skyshader.js',
 ];
 const NETWORK_TIMEOUT_MS = 4000;
 

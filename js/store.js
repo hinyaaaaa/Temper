@@ -42,8 +42,6 @@ const STATE_DEFAULTS = {
     holidayWeekdays: [0, 6],
     // 日付単位の手動上書き { 'YYYY-MM-DD': 'weekday' | 'holiday' }
     dayTypeOverrides: {},
-    weatherAutoLocation: true,
-    manualWeatherCondition: null,
   },
   stats: {
     weekday: {},         // { [0-6]: { completed:number, missed:number } }
@@ -132,7 +130,9 @@ export function normalizeState(state) {
   s.capacityHoliday = clampInt(s.capacityHoliday, CAPACITY_MIN, CAPACITY_MAX, 10);
   if (!Array.isArray(s.holidayWeekdays)) s.holidayWeekdays = [0, 6];
   if (!s.dayTypeOverrides || typeof s.dayTypeOverrides !== 'object') s.dayTypeOverrides = {};
-  s.weatherAutoLocation = s.weatherAutoLocation !== false;
+  // v1.8.0: 現実の天気の取得を廃止。旧保存データ・旧バックアップに残る設定を落とす
+  delete s.weatherAutoLocation;
+  delete s.manualWeatherCondition;
   delete s.chronotype; // 自己入力機能は廃止（HANDOFF §14）。旧保存データの残骸を落とす
   state.settings = s;
 

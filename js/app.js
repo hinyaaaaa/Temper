@@ -3,12 +3,15 @@
    ------------------------------------------------------------
    責務（憲法6条: 分離の原則）:
      - store.js（データ・設定の解決）、planner.js（今日の選定）、
-       weather.js（空の色）を「呼ぶだけ」で、判断ロジックは書かない。
+       forecast.js（タスク状況→見通し）、weather.js（空のモデル）、
+       skyrender.js（空の描画）を「呼ぶだけ」で、判断ロジックは書かない。
      - 画面遷移・DOM描画・イベント配線のみを担当する。
    ============================================================ */
 import * as Store from './store.js';
 import * as Planner from './planner.js';
 import * as Weather from './weather.js';
+import * as Forecast from './forecast.js';
+import { createSky } from './skyrender.js';
 
 /* ------------------------------------------------------------
    状態
@@ -18,11 +21,10 @@ let currentPage = 'today';
 let currentTodayPlan = null;
 let currentPlanDate = null; // currentTodayPlan がどの日付向けに作られたか
 let editingTaskId = null;
-let weatherState = null;   // { condition, temperature, source } | null（取得失敗時）
 let pendingImport = null;  // インポート確認中のデータ
 
 /** 設定タブに小さく表示するだけの表示用バージョン。改修のたびに上げる。 */
-const APP_VERSION = 'v1.7.0';
+const APP_VERSION = 'v1.8.0';
 
 const todayStr = () => {
   const d = new Date();
@@ -133,6 +135,7 @@ function render() {
     root.innerHTML = `<div class="empty-state glass card"><div class="glyph">⚠</div><div class="msg">表示中にエラーが発生しました：${esc(String(err && err.message || err))}</div></div>`;
   }
   updateFab();
+  refreshSky();
 }
 
 /* ------------------------------------------------------------
@@ -174,37 +177,10 @@ function setRangeFill(el) {
 }
 
 /* ------------------------------------------------------------
-   今日画面（SPEC §6: 日付 → 天候 → 今日の進捗 → 今日のタスク）
+   今日画面（SPEC §6: 日付 → 今日の進捗 → 今日のタスク）
+   v1.8.0: 天候の行（時間帯・天気名・気温）は廃止した。空そのものが
+   タスクの見通しを映すので、文字では説明しない。
    ------------------------------------------------------------ */
-function weatherGlyphSvg(condition, timeOfDay) {
-  const open = '<svg class="weather-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">';
-  if (condition === 'rain') {
-    return open + '<path d="M7 16.5a4.5 4.5 0 01.5-8.98A6 6 0 0119 10.5a3.75 3.75 0 01-.5 7.48"/><line x1="9" y1="19" x2="9" y2="21.5"/><line x1="13" y1="19" x2="13" y2="21.5"/><line x1="17" y1="19" x2="17" y2="21.5"/></svg>';
-  }
-  if (condition === 'cloudy') {
-    return open + '<path d="M7 16.5a4.5 4.5 0 01.5-8.98A6 6 0 0119 10.5a3.75 3.75 0 01-.5 7.48H7z"/></svg>';
-  }
-  if (timeOfDay === 'night') {
-    return open + '<path d="M20 14.2A8.2 8.2 0 019.8 4 8.4 8.4 0 1020 14.2z"/></svg>';
-  }
-  return open + '<circle cx="12" cy="12" r="4.2"/><line x1="12" y1="2.5" x2="12" y2="4.5"/><line x1="12" y1="19.5" x2="12" y2="21.5"/><line x1="4.2" y1="4.2" x2="5.6" y2="5.6"/><line x1="18.4" y1="18.4" x2="19.8" y2="19.8"/><line x1="2.5" y1="12" x2="4.5" y2="12"/><line x1="19.5" y1="12" x2="21.5" y2="12"/><line x1="4.2" y1="19.8" x2="5.6" y2="18.4"/><line x1="18.4" y1="5.6" x2="19.8" y2="4.2"/></svg>';
-}
-
-/**
- * 天候行の文言。
- * 取得に失敗しても「取得できませんでした」というエラー文をヒーローに
- * 出さない（SPEC §18 / 憲法11条: 失敗しても主機能は静かに続く）。
- * 分かっている情報だけを状態語として並べる。
- */
-function skyRowText(timeOfDay) {
-  const parts = [Weather.TIME_LABELS[timeOfDay] || ''];
-  if (weatherState) {
-    parts.push(Weather.WEATHER_LABELS[weatherState.condition] || '晴れ');
-    if (weatherState.temperature != null) parts.push(weatherState.temperature + '℃');
-  }
-  return parts.filter(Boolean).join('　');
-}
-
 function renderTodayPage() {
   const today = todayStr();
   if (!currentTodayPlan) recomputeTodayPlan();
@@ -237,8 +213,6 @@ function renderTodayPage() {
   const plannedOffset = C * (1 - frac(totalLoad));
   const doneOffset = C * (1 - frac(doneLoad));
 
-  const timeOfDay = Weather.getTimeOfDay();
-  const condition = weatherState ? weatherState.condition : 'clear';
   const finishLabel = estimateAllTasksFinishLabel(today, doneLoad);
 
   let taskListHtml;
@@ -253,7 +227,6 @@ function renderTodayPage() {
   return `
     <div class="page-head">
       <div class="today-date">${formatDateLabel(today)}</div>
-      <div class="today-sky-row">${weatherGlyphSvg(condition, timeOfDay)}<span>${esc(skyRowText(timeOfDay))}</span></div>
     </div>
 
     <div class="card glass progress-card">
@@ -747,13 +720,6 @@ function renderSettingsPage() {
     </div>
 
     <div class="card glass">
-      <div class="settings-row">
-        <div class="settings-row-title">天気を自動取得</div>
-        <button class="toggle ${s.weatherAutoLocation ? 'on' : ''}" role="switch" aria-checked="${s.weatherAutoLocation}" onclick="Temper.toggleWeatherAuto()"></button>
-      </div>
-    </div>
-
-    <div class="card glass">
       <div class="settings-stack">
         <button class="btn btn-primary btn-full" onclick="Temper.pickImportFile()">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="M7 8l5-5 5 5"/><path d="M4 15v4a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg>
@@ -782,13 +748,6 @@ function onCapacityInput(kind, v) {
 function stepCapacity(kind, delta) {
   const cur = kind === 'holiday' ? state.settings.capacityHoliday : state.settings.capacityWeekday;
   onCapacityInput(kind, Math.max(Store.CAPACITY_MIN, Math.min(Store.CAPACITY_MAX, cur + delta)));
-}
-
-function toggleWeatherAuto() {
-  state.settings.weatherAutoLocation = !state.settings.weatherAutoLocation;
-  persist();
-  render();
-  refreshWeather();
 }
 
 /* ------------------------------------------------------------
@@ -896,148 +855,104 @@ function showToast(msg) {
 }
 
 /* ------------------------------------------------------------
-   天候・空の更新（憲法11条: 失敗しても主機能は継続）
+   空の更新（憲法11条: 失敗しても主機能は継続）
+   ------------------------------------------------------------
+   v1.8.0: 空は現実の天気ではなく、今日〜3日先のタスクの見通しを映す。
+     forecast.js … タスク状況 → 見通し(pressure)・逼迫が解けた度合い(relief)
+     weather.js  … 見通し・時刻・季節 → 空の状態
+     skyrender.js… 空の状態 → 描画（変化は約10秒かけて穏やかに）
+   このファイルは3つを呼んで繋ぐだけで、判断は書かない。
+   外部通信はしない（位置情報も使わない）。
    ------------------------------------------------------------ */
-async function refreshWeather() {
+const SKY_MEMORY_KEY = 'temper-sky-memory';
+let sky = null;
+let skyMemory = null;     // { peak, at }  直近の逼迫の最大値（relief の計算用）。端末内の小さな補助値
+let skyTone = 'dark';
+
+function loadSkyMemory() {
   try {
-    const manual = state.settings.weatherAutoLocation ? null : (state.settings.manualWeatherCondition || 'clear');
-    weatherState = await Weather.getWeather(manual);
-  } catch (e) {
-    weatherState = null;
-  }
-  applySky();
-  if (currentPage === 'today') render();
+    const v = JSON.parse(localStorage.getItem(SKY_MEMORY_KEY) || 'null');
+    return v && Number.isFinite(v.peak) && Number.isFinite(v.at) ? v : null;
+  } catch (e) { return null; }
+}
+let skyMemorySaved = { peak: -1, at: 0 };
+function saveSkyMemory() {
+  // render() のたびに呼ばれるので、値が動いたときか1分おきにだけ書く
+  if (skyMemory && Math.abs(skyMemory.peak - skyMemorySaved.peak) < 0.01 && skyMemory.at - skyMemorySaved.at < 60000) return;
+  skyMemorySaved = { ...skyMemory };
+  try { localStorage.setItem(SKY_MEMORY_KEY, JSON.stringify(skyMemory)); } catch (e) { /* 保存できなくても空は動く */ }
 }
 
-function applySky() {
-  const timeOfDay = Weather.getTimeOfDay();
-  const condition = weatherState ? weatherState.condition : 'clear';
-  const sky = document.getElementById('sky');
-  sky.dataset.time = timeOfDay;
-  sky.dataset.condition = condition;
+function initSky() {
+  const skyEl = document.getElementById('sky');
+  try {
+    sky = createSky({
+      gl: document.getElementById('sky-gl'),
+      fx: document.getElementById('sky-fx'),
+      onChrome: applySkyChrome,
+    });
+    skyMemory = loadSkyMemory();
+    refreshSky({ snap: true });
+    sky.start();
+  } catch (e) {
+    console.error('[Temper] sky init failed', e);
+    sky = null;
+  }
+  // 初回フレームの描画後にふわっと表示する
+  requestAnimationFrame(() => requestAnimationFrame(() => skyEl.classList.add('ready')));
+}
 
-  const profile = Weather.getSkyProfile(timeOfDay, condition);
-  sky.style.background = Weather.skyGradient(profile);
-  document.getElementById('sky-scrim').style.background = Weather.scrimGradient(profile);
+function refreshSky({ snap = false } = {}) {
+  if (!sky) return;
+  try {
+    const today = todayStr();
+    if (!currentTodayPlan || currentPlanDate !== today) recomputeTodayPlan();
+    const plan = currentTodayPlan;
+    const pendingLoad = plan.entries
+      .filter((e) => !isTaskDoneToday(e.id, today))
+      .reduce((sum, e) => sum + e.load, 0);
+    const f = Forecast.computePressure({
+      tasks: state.tasks,
+      todayStr: today,
+      capacityForDate: (dateStr) => Store.getCapacityFor(state, dateStr),
+      weekdayStats: Store.deriveWeekdayStats(state),
+      alreadyDoneLoad: computeDoneLoadToday(today),
+      todayPendingLoad: pendingLoad,
+      todayCapacity: plan.fullCapacity,
+    });
+    const now = new Date();
+    const r = Forecast.updateRelief(skyMemory, f.pressure, now.getTime());
+    skyMemory = r.memory;
+    saveSkyMemory();
+    const target = Weather.resolveSky({ pressure: f.pressure, relief: r.relief, date: now, drift: Weather.skyDrift(now) });
+    sky.setTarget(target, { snap });
+  } catch (e) {
+    console.error('[Temper] sky refresh failed', e);
+  }
+}
 
-  const tone = Weather.getTextToneFor(timeOfDay);
-  document.documentElement.dataset.tone = tone === 'light' ? 'light' : '';
-
+/** 描画エンジンが約0.5秒ごとに渡す、現在の空の端の色と明るさを画面に反映する */
+function applySkyChrome({ zenith, edge, lum }) {
+  const root = document.documentElement;
+  // 文字色は、実際に描いた画素から測った明るさで決める（雲・雨・霧を含む見た目どおり）
+  const tone = Weather.toneFor(lum, skyTone);
+  if (tone !== skyTone || !applySkyChrome._done) {
+    skyTone = tone;
+    if (tone === 'light') root.setAttribute('data-tone', 'light'); else root.removeAttribute('data-tone');
+  }
   // ビューポートの外側（Safariの上下バーの裏・セーフエリア）も空の続きで塗る。
   // ここを塗らないと画面下部に白帯が出る。
-  const root = document.documentElement;
-  root.style.backgroundImage = Weather.canvasGradient(profile);
-  root.style.backgroundAttachment = 'fixed';
-  root.style.backgroundSize = '100% 300%';
-  root.style.backgroundPosition = 'center center';
-  root.style.backgroundRepeat = 'no-repeat';
-  root.style.setProperty('--canvas', Weather.edgeColor(profile));
-  document.getElementById('theme-color-meta').setAttribute('content', Weather.edgeColor(profile));
-
-  const sun = document.getElementById('sky-sun');
-  sun.style.left = profile.sun.x + '%';
-  sun.style.top = profile.sun.y + '%';
-  sun.style.width = profile.sun.size + 'vmax';
-  sun.style.height = profile.sun.size + 'vmax';
-  sun.style.opacity = String(profile.sun.strength);
-  sun.style.background = Weather.sunGradient(profile);
-
-  const cloudsContainer = document.getElementById('sky-clouds');
-  cloudsContainer.style.opacity = String(profile.cloud.opacity);
-  ensureClouds();
-  cloudsContainer.querySelectorAll('.cloud').forEach((c) => { c.style.color = profile.cloud.tint; });
-
-  ensureStars();
-  document.getElementById('sky-stars').style.opacity = String(profile.starOpacity);
-  ensureRain();
-}
-
-/** 積雲らしい輪郭を、深く重ねた楕円とSVGぼかしで描く */
-function ensureClouds() {
-  const container = document.getElementById('sky-clouds');
-  if (container.childElementCount > 0) return;
-  const puffLayouts = [
-    [50, 6, 26, 15],
-    [32, 10, 22, 13], [68, 10, 22, 13],
-    [18, 14, 16, 10], [82, 14, 16, 10],
-    [40, -6, 20, 13], [60, -6, 20, 13],
-    [8, 18, 11, 7], [92, 18, 11, 7],
-  ];
-  const clouds = [
-    { w: 40, top: 10, duration: 150, delay: -10, driftX: 8 },
-    { w: 30, top: 26, duration: 190, delay: -90, driftX: 55 },
-    { w: 34, top: 4, duration: 165, delay: -140, driftX: -15 },
-  ];
-  clouds.forEach((cfg) => {
-    const wrap = document.createElement('div');
-    wrap.className = 'cloud';
-    wrap.style.width = cfg.w + 'vw';
-    wrap.style.top = cfg.top + '%';
-    wrap.style.left = cfg.driftX + 'vw';
-    wrap.style.animationDuration = cfg.duration + 's';
-    wrap.style.animationDelay = cfg.delay + 's';
-
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.setAttribute('viewBox', '0 0 100 32');
-    svg.setAttribute('preserveAspectRatio', 'none');
-    const filterId = 'cloud-blur-' + Math.random().toString(36).slice(2, 8);
-    const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
-    const filter = document.createElementNS('http://www.w3.org/2000/svg', 'filter');
-    filter.setAttribute('id', filterId);
-    filter.setAttribute('x', '-20%'); filter.setAttribute('y', '-20%');
-    filter.setAttribute('width', '140%'); filter.setAttribute('height', '140%');
-    const blur = document.createElementNS('http://www.w3.org/2000/svg', 'feGaussianBlur');
-    blur.setAttribute('stdDeviation', '1.6');
-    filter.appendChild(blur);
-    defs.appendChild(filter);
-    svg.appendChild(defs);
-
-    const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-    group.setAttribute('filter', `url(#${filterId})`);
-    puffLayouts.forEach(([cx, cy, rx, ry]) => {
-      const ellipse = document.createElementNS('http://www.w3.org/2000/svg', 'ellipse');
-      ellipse.setAttribute('cx', cx);
-      ellipse.setAttribute('cy', 18 + cy * 0.32);
-      ellipse.setAttribute('rx', rx * 0.42);
-      ellipse.setAttribute('ry', ry * 0.42);
-      ellipse.setAttribute('class', 'cloud-puff');
-      group.appendChild(ellipse);
-    });
-    svg.appendChild(group);
-    wrap.appendChild(svg);
-    container.appendChild(wrap);
-  });
-}
-
-function ensureStars() {
-  const container = document.getElementById('sky-stars');
-  if (container.childElementCount > 0) return;
-  for (let i = 0; i < 90; i++) {
-    const s = document.createElement('div');
-    s.className = 'star';
-    const size = Math.random() < 0.15 ? 2.4 : Math.random() < 0.5 ? 1.6 : 1.1;
-    s.style.width = size + 'px';
-    s.style.height = size + 'px';
-    s.style.left = Math.random() * 100 + '%';
-    s.style.top = Math.random() * 62 + '%';
-    s.style.opacity = String(0.4 + Math.random() * 0.6);
-    s.style.animationDuration = (2.5 + Math.random() * 3.5) + 's';
-    s.style.animationDelay = (Math.random() * 4) + 's';
-    container.appendChild(s);
+  root.style.backgroundImage = `linear-gradient(180deg, ${zenith} 0%, ${zenith} 33.34%, ${edge} 66.67%, ${edge} 100%)`;
+  if (!applySkyChrome._done) {
+    root.style.backgroundAttachment = 'fixed';
+    root.style.backgroundSize = '100% 300%';
+    root.style.backgroundPosition = 'center center';
+    root.style.backgroundRepeat = 'no-repeat';
   }
-}
-
-function ensureRain() {
-  const container = document.getElementById('sky-rain');
-  if (container.childElementCount > 0) return;
-  for (let i = 0; i < 40; i++) {
-    const d = document.createElement('div');
-    d.className = 'rain-drop';
-    d.style.left = Math.random() * 100 + '%';
-    d.style.animationDuration = (0.6 + Math.random() * 0.5) + 's';
-    d.style.animationDelay = Math.random() * 1 + 's';
-    container.appendChild(d);
-  }
+  root.style.setProperty('--canvas', edge);
+  const meta = document.getElementById('theme-color-meta');
+  if (meta) meta.setAttribute('content', edge);
+  applySkyChrome._done = true;
 }
 
 /* ------------------------------------------------------------
@@ -1095,13 +1010,19 @@ function init() {
   init._ran = true;
   try {
     recomputeTodayPlan();
-    applySky();
+    initSky();
     render();
-    refreshWeather();
     Store.requestPersistentStorage();
     registerOfflineSupport();
     restoreFromBackupIfLost().catch(() => {});
-    setInterval(applySky, 5 * 60 * 1000);
+    // 時刻に伴う空の移ろい（日の出・夕焼けなど）と、日内のゆらぎのため、15秒ごとに更新する。
+    setInterval(() => refreshSky(), 15 * 1000);
+    // 長く閉じていた後に戻ってきたときは、古い空から動かさず今の空で始める。
+    let hiddenAt = 0;
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) { hiddenAt = Date.now(); return; }
+      refreshSky({ snap: hiddenAt && Date.now() - hiddenAt > 10 * 60 * 1000 });
+    });
     // 何も操作しないままアプリを開きっぱなしで日付をまたいだ場合でも
     // 今日のプランが古いまま残らないよう、1分おきに日付の変化を確認する。
     // render()自身もensureTodayPlanFresh()で日付を見るが、それは何らかの
@@ -1133,7 +1054,7 @@ window.Temper = {
   openDetailSheet, closeDetailSheet, setTaskFilter, setTaskSort, setTodayType,
   openAddTask, openEditTask, deleteTask, saveTaskFromModal, closeTaskModal,
   onLoadSliderInput, stepLoad, clearDateField, setTaskType, toggleModalWeekDay,
-  onCapacityInput, stepCapacity, toggleWeatherAuto,
+  onCapacityInput, stepCapacity,
   pickImportFile, exportBackup,
 };
 
