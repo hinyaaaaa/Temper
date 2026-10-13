@@ -11,6 +11,7 @@
 // ============================================================
 import * as Planner from './js/planner.js';
 import * as Store from './js/store.js';
+import * as Forecast from './js/forecast.js';
 
 // ---------------- 決定的な疑似乱数（再現性のため） ----------------
 function mulberry32(seed) {
@@ -148,17 +149,25 @@ function fuzzSingleDay(rng, iterations) {
       }
     }
 
-    // 充填分（filled/weekly）が残り容量を超えていないか
-    const forcedLoad = plan.entries.filter((e) => e.src === 'overdue' || e.src === 'today_deadline').reduce((s, e) => s + e.load, 0);
-    const filledLoad = plan.entries.filter((e) => e.src === 'filled' || e.src === 'weekly').reduce((s, e) => s + e.load, 0);
-    const remainingCap = Math.max(0, plan.effectiveCapacity - forcedLoad);
+    // 充填分（filled）が残り容量を超えていないか。
+    // v1.9.0: 週次タスクと明日期限(soon)は強制枠。充填分はその残りの中に収まる。
+    const mandatoryLoad = plan.entries.filter((e) => e.src === 'overdue' || e.src === 'today_deadline' || e.src === 'weekly' || e.src === 'soon').reduce((s, e) => s + e.load, 0);
+    const filledLoad = plan.entries.filter((e) => e.src === 'filled').reduce((s, e) => s + e.load, 0);
+    const remainingCap = Math.max(0, plan.effectiveCapacity - mandatoryLoad);
     assert(filledLoad <= remainingCap, '充填分の合計が残り容量を超えている', { ...ctx, filledLoad, remainingCap });
 
-    // ナップサック最適性をブルートフォースと突き合わせる
-    const restCandidates = candidates.filter((c) => {
-      const forced = c.type !== 'weekly' && c.deadline && daysBetween(c.deadline, todayStr) <= 0;
-      return !forced;
-    });
+    // v1.9.0: 今日が対象曜日で未完了の週次タスクは、容量に関わらず必ず出る
+    for (const c of candidates) {
+      if (c.type === 'weekly') assert(seen.has(c.id), '今日の週次タスクが選ばれていない（必ず表示の違反）', { ...ctx, taskId: c.id });
+    }
+
+    // ナップサック最適性をブルートフォースと突き合わせる（偏り回避は切って、純粋な最適性だけを見る）
+    const plain = Planner.buildTodayPlan({ tasks, todayStr, baseCapacity: capacity, diversity: false });
+    const plainMandatory = plain.entries.filter((e) => e.src === 'overdue' || e.src === 'today_deadline' || e.src === 'weekly' || e.src === 'soon');
+    const plainMandatoryIds = new Set(plainMandatory.map((e) => e.id));
+    const plainMandatoryLoad = plainMandatory.reduce((s, e) => s + e.load, 0);
+    const plainRemainingCap = Math.max(0, plain.effectiveCapacity - plainMandatoryLoad);
+    const restCandidates = candidates.filter((c) => !plainMandatoryIds.has(c.id));
     if (restCandidates.length <= 16) {
       const items = restCandidates.map((t) => {
         const du = (t.type === 'weekly' || !t.deadline) ? Infinity : daysBetween(t.deadline, todayStr);
@@ -170,11 +179,11 @@ function fuzzSingleDay(rng, iterations) {
         const value = Math.max(0.01, deadlineScore + Planner.deadlinePhaseBonus(pattern, du) + 1);
         return { load: Math.max(1, Math.round(t.load || 1)), value, id: t.id };
       });
-      const bruteBest = bruteForceKnapsack(items, remainingCap);
+      const bruteBest = bruteForceKnapsack(items, plainRemainingCap);
       if (bruteBest !== null) {
-        const chosenIds = new Set(plan.entries.filter((e) => e.src === 'filled' || e.src === 'weekly').map((e) => e.id));
+        const chosenIds = new Set(plain.entries.filter((e) => e.src === 'filled').map((e) => e.id));
         const chosenValue = items.filter((it) => chosenIds.has(it.id)).reduce((s, it) => s + it.value, 0);
-        assert(Math.abs(chosenValue - bruteBest) < 1e-6, 'ナップサック選択が最適でない（容量の使い残しの可能性）', { ...ctx, chosenValue, bruteBest, remainingCap, itemCount: items.length });
+        assert(Math.abs(chosenValue - bruteBest) < 1e-6, 'ナップサック選択が最適でない（容量の使い残しの可能性）', { ...ctx, chosenValue, bruteBest, plainRemainingCap, itemCount: items.length });
       }
     }
 
@@ -713,10 +722,11 @@ function testErgonomicsFeatures() {
     const today = '2026-09-27';
     // 全タスクを同一Patternにして、Pattern連続回避による並べ替えの
     // 影響を排除し、純粋にLoadによるタイブレークだけを見る。
+    // （v1.9.0: タイトルは別々の問題集にする。同じ問題集は離して並べるため）
     const tasks = [
-      { id: 'heavy1', title: '重い1', load: 6, type: 'once', deadline: null, pattern: 'reading' },
-      { id: 'heavy2', title: '重い2', load: 6, type: 'once', deadline: null, pattern: 'reading' },
-      { id: 'light', title: '軽い', load: 1, type: 'once', deadline: null, pattern: 'reading' },
+      { id: 'heavy1', title: 'アルファ', load: 6, type: 'once', deadline: null, pattern: 'reading' },
+      { id: 'heavy2', title: 'ブラボー', load: 6, type: 'once', deadline: null, pattern: 'reading' },
+      { id: 'light', title: 'チャーリー', load: 1, type: 'once', deadline: null, pattern: 'reading' },
     ];
     const plan = Planner.buildTodayPlan({ tasks, todayStr: today, baseCapacity: 20 });
     assert(plan.entries.length === 3, '[ergonomics-shape] 起伏テスト用タスクが全件選定されない（前提条件が崩れている）', { picked: plan.entries.map((e) => e.id) });
@@ -880,6 +890,188 @@ testErgonomicsFeatures();
 
 console.log('=== PART I: 受験向け（時期補正・間に合い具合・完了時刻の学習・自動バックアップ） ===');
 testExamFeatures();
+
+
+// ============================================================
+// PART J — v1.9.0: 追加生成・偏り回避・週次必ず表示・天気の感度・明日期限
+// ============================================================
+function testV190() {
+  const today = '2026-10-14'; // 水曜(3)
+  const mk = (id, title, load, o = {}) => ({
+    id, title, description: '', type: 'once', load, deadline: null, unlockDate: null,
+    weekDays: [], doneDates: [], done: false, doneDate: null, pattern: null, ...o,
+  });
+  const ids = (plan) => plan.entries.map((e) => e.id);
+
+  // --- ③ 週次タスクは容量が埋まっていても必ず出る ---
+  {
+    const tasks = [
+      mk('w1', '週次見直し', 1, { type: 'weekly', weekDays: [3] }),
+      mk('w2', '週次ノート', 2, { type: 'weekly', weekDays: [3] }),
+      mk('w3', '週次(別の曜日)', 2, { type: 'weekly', weekDays: [1] }),
+      ...Array.from({ length: 8 }, (_, i) => mk('o' + i, '単発' + String.fromCharCode(65 + i), 3, { deadline: addDays(today, 5 + i) })),
+    ];
+    const plan = Planner.buildTodayPlan({ tasks, todayStr: today, baseCapacity: 4 });
+    assert(ids(plan).includes('w1') && ids(plan).includes('w2'), '[v190-weekly] 今日の週次タスクが容量4でも出ない', { ids: ids(plan) });
+    assert(!ids(plan).includes('w3'), '[v190-weekly] 別の曜日の週次タスクが出ている', { ids: ids(plan) });
+    assert(plan.entries.filter((e) => e.src === 'weekly').length === 2, '[v190-weekly] 週次のsrcが違う', { entries: plan.entries.map((e) => [e.id, e.src]) });
+  }
+
+  // --- ⑤ 明日期限のタスクは、容量が満杯でも今日のおすすめに出る ---
+  {
+    const base = [
+      mk('a', '英単語A', 5, { deadline: addDays(today, 3) }),
+      mk('b', '古文B', 5, { deadline: addDays(today, 4) }),
+      mk('c', '数学C', 5, { deadline: addDays(today, 6) }),
+    ];
+    const full = Planner.buildTodayPlan({ tasks: base, todayStr: today, baseCapacity: 10 });
+    assert(full.totalLoad >= 10 - 1, '[v190-soon] 前提: 容量がほぼ埋まっていない', { total: full.totalLoad });
+    const added = [...base, mk('t', '明日提出', 4, { deadline: addDays(today, 1) })];
+    const p2 = Planner.buildTodayPlan({ tasks: added, todayStr: today, baseCapacity: 10 });
+    assert(ids(p2).includes('t'), '[v190-soon] 明日期限のタスクが満杯の日でも出ない', { ids: ids(p2) });
+    assert(p2.entries.find((e) => e.id === 't').src === 'soon', '[v190-soon] srcがsoonでない', {});
+    assert(p2.entries.find((e) => e.id === 't').overCapacity === false, '[v190-soon] soonにoverCapacityが立った', {});
+    // 巨大な明日期限が大量にあっても、容量の+30%を超えて無制限には積まない
+    const flood = Array.from({ length: 10 }, (_, i) => mk('f' + i, '山' + String.fromCharCode(65 + i), 6, { deadline: addDays(today, 1) }));
+    const p3 = Planner.buildTodayPlan({ tasks: flood, todayStr: today, baseCapacity: 10 });
+    assert(p3.totalLoad <= 10 + Math.ceil(10 * 0.3), '[v190-soon] 明日期限が際限なく積まれた', { total: p3.totalLoad });
+    assert(p3.entries.length >= 1, '[v190-soon] 明日期限が1件も出ない', {});
+    const e = p2.entries.find((x) => x.id === 't');
+    assert(Planner.explainSelection(e).includes('明日'), '[v190-soon] 説明文に明日が出ない', { r: Planner.explainSelection(e) });
+  }
+
+  // --- ⑤' 途中でタスクを足しても、既存の選定と並びは入れ替わらない（pin） ---
+  {
+    const tasks = [
+      mk('p1', '英単語A', 3, { pattern: 'memorization' }),
+      mk('p2', '古文B', 3, { pattern: 'reading' }),
+      mk('p3', '数学C', 3, { pattern: 'practice' }),
+      mk('p4', '化学D', 3, { pattern: 'reinforcement' }),
+      mk('p5', '物理E', 3, { pattern: 'problem_solving' }),
+      mk('p6', '地理F', 3, { pattern: 'writing' }),
+    ];
+    const first = Planner.buildTodayPlan({ tasks, todayStr: today, baseCapacity: 9 });
+    const order1 = ids(first);
+    // 時間帯が変わっても、未登録の新タスクが来ても、選定・並びは変わらない
+    const tasks2 = [...tasks, mk('n1', '新規G', 3, { deadline: addDays(today, 20), pattern: 'simulation' })];
+    const again = Planner.buildTodayPlan({ tasks: tasks2, todayStr: today, baseCapacity: 9, timeOfDay: 'night', pinIds: first.pinIds });
+    assert(order1.every((id, i) => ids(again)[i] === id), '[v190-pin] 既存の選定・並びが入れ替わった', { before: order1, after: ids(again) });
+    assert(ids(again).length === order1.length, '[v190-pin] 容量いっぱいなのに件数が増えた/減った', { before: order1, after: ids(again) });
+    // pinを渡さなければ（従来動作）選び直しになりうる = pinが効いていることの対照
+    const urgent = [...tasks, mk('u1', '明日の提出', 3, { deadline: addDays(today, 1), pattern: 'practice' })];
+    const withUrgent = Planner.buildTodayPlan({ tasks: urgent, todayStr: today, baseCapacity: 9, pinIds: first.pinIds });
+    assert(ids(withUrgent).includes('u1'), '[v190-pin] pin下でも明日期限は差し込まれるべき', { ids: ids(withUrgent) });
+    const kept = order1.filter((id) => ids(withUrgent).includes(id));
+    const keptOrder = ids(withUrgent).filter((id) => order1.includes(id));
+    assert(kept.every((id, i) => keptOrder[i] === id), '[v190-pin] 差し込みで既存の相対順が崩れた', { before: order1, after: ids(withUrgent) });
+    // 容量を下げたら後ろから外れる / 完了済みはpinから落ちても問題ない
+    const shrunk = Planner.buildTodayPlan({ tasks, todayStr: today, baseCapacity: 4, pinIds: first.pinIds, pinCapacity: first.totalCapacity });
+    assert(shrunk.totalLoad <= shrunk.effectiveCapacity, '[v190-pin] 容量を下げても超過したまま', { total: shrunk.totalLoad, eff: shrunk.effectiveCapacity });
+    // 容量が変わっていない（または上がった）なら、期限が近いものが入っても既存の選定は1件も外れない
+    const noEvict = Planner.buildTodayPlan({ tasks: urgent, todayStr: today, baseCapacity: 9, pinIds: first.pinIds, pinCapacity: first.totalCapacity });
+    assert(order1.every((id) => ids(noEvict).includes(id)), '[v190-pin] 明日期限の追加で既存の選定が押し出された', { before: order1, after: ids(noEvict) });
+    const raised = Planner.buildTodayPlan({ tasks, todayStr: today, baseCapacity: 15, pinIds: first.pinIds, pinCapacity: first.totalCapacity });
+    assert(order1.every((id, i) => ids(raised)[i] === id), '[v190-pin] 容量を上げたら既存の並びが崩れた', { before: order1, after: ids(raised) });
+    assert(raised.entries.length > order1.length, '[v190-pin] 容量を上げても追加されない', { n: raised.entries.length });
+  }
+
+  // --- ① 追加で生成（forceExtra / capacityBonus） ---
+  {
+    const tasks = Array.from({ length: 8 }, (_, i) => mk('x' + i, '教材' + String.fromCharCode(65 + i), 3, { pattern: ['memorization', 'reading', 'practice', 'writing'][i % 4] }));
+    const p0 = Planner.buildTodayPlan({ tasks, todayStr: today, baseCapacity: 9 });
+    assert(p0.extraCount === tasks.length - p0.entries.length, '[v190-extra] extraCountが残り候補数と合わない', { extra: p0.extraCount, n: p0.entries.length });
+    assert(p0.extraCount > 0, '[v190-extra] 前提: 候補が余っていない', {});
+    // 一部を完了させ、上乗せ容量を足して再生成すると、既存は保ったまま追加される
+    const done = tasks.map((t) => ({ ...t }));
+    const firstId = p0.entries[0].id;
+    done.find((t) => t.id === firstId).done = true; done.find((t) => t.id === firstId).doneDate = today;
+    const p1 = Planner.buildTodayPlan({ tasks: done, todayStr: today, baseCapacity: 9, alreadyDoneLoad: 3, capacityBonus: 4, pinIds: p0.pinIds });
+    assert(p1.totalCapacity === 13, '[v190-extra] totalCapacityが上乗せを含まない', { t: p1.totalCapacity });
+    assert(p1.entries.length > p0.entries.length - 1, '[v190-extra] 追加分が増えない', { before: p0.entries.length, after: p1.entries.length });
+    // 収まる候補が無くても forceExtra なら最低1件追加される
+    const heavy = Array.from({ length: 4 }, (_, i) => mk('h' + i, '重' + String.fromCharCode(65 + i), 9, { pattern: ['memorization', 'reading', 'practice', 'writing'][i] }));
+    const h0 = Planner.buildTodayPlan({ tasks: heavy, todayStr: today, baseCapacity: 9 });
+    assert(h0.entries.length === 1 && h0.extraCount === 3, '[v190-extra] 前提: 重いタスクで1件のみ', { n: h0.entries.length });
+    const hx = Planner.buildTodayPlan({ tasks: heavy.map((t) => (t.id === h0.entries[0].id ? { ...t, done: true, doneDate: today } : t)), todayStr: today, baseCapacity: 9, alreadyDoneLoad: 9, capacityBonus: 2, pinIds: h0.pinIds, forceExtra: true });
+    assert(hx.entries.length >= 1, '[v190-extra] forceExtraで1件も出ない', {});
+    const none = Planner.buildTodayPlan({ tasks: heavy.map((t) => (t.id === h0.entries[0].id ? { ...t, done: true, doneDate: today } : t)), todayStr: today, baseCapacity: 9, alreadyDoneLoad: 9, capacityBonus: 2, pinIds: h0.pinIds });
+    assert(none.entries.length === 0, '[v190-extra] forceExtraなしでは容量外は出さない', { n: none.entries.length });
+    // 候補が尽きたら extraCount=0（ボタンを出さない根拠）
+    const exhausted = Planner.buildTodayPlan({ tasks: tasks.map((t) => ({ ...t, done: true, doneDate: today })), todayStr: today, baseCapacity: 9, alreadyDoneLoad: 24 });
+    assert(exhausted.extraCount === 0 && exhausted.entries.length === 0, '[v190-extra] 全完了でextraCountが0でない', { e: exhausted.extraCount });
+  }
+
+  // --- ② 同じ認知タイプ・同じ問題集の偏り回避 ---
+  {
+    // 青チャート6件(同じ問題集・同じ認知タイプ) + 他の種類
+    const tasks = [
+      ...Array.from({ length: 6 }, (_, i) => mk('ao' + i, '青チャート 例題' + (10 + i), 2, { deadline: addDays(today, 10) })),
+      mk('en', '英単語 Unit5', 2, { deadline: addDays(today, 10) }),
+      mk('ko', '古文 読解', 2, { deadline: addDays(today, 10) }),
+      mk('wr', '英作文 添削', 2, { deadline: addDays(today, 10) }),
+      mk('ph', '物理 原因を考える', 2, { deadline: addDays(today, 10) }),
+      mk('ka', '化学 復習ワーク', 2, { deadline: addDays(today, 10) }),
+    ];
+    const plan = Planner.buildTodayPlan({ tasks, todayStr: today, baseCapacity: 12 });
+    const aoCount = plan.entries.filter((e) => e.id.startsWith('ao')).length;
+    assert(aoCount <= 2, '[v190-diverse] 同じ問題集が1日に3件以上出た', { aoCount, ids: ids(plan) });
+    assert(plan.entries.length >= 6, '[v190-diverse] 偏り回避で件数が落ちすぎた', { ids: ids(plan) });
+    for (let i = 0; i + 1 < plan.entries.length; i++) {
+      assert(plan.entries[i].pattern !== plan.entries[i + 1].pattern || plan.entries.filter((e) => e.pattern === plan.entries[i].pattern).length * 2 > plan.entries.length + 1, '[v190-diverse] 同じ認知タイプが隣り合った', { ids: ids(plan), patterns: plan.entries.map((e) => e.pattern) });
+      const bi = tasks.find((t) => t.id === plan.entries[i].id), bj = tasks.find((t) => t.id === plan.entries[i + 1].id);
+      assert(Planner.bookKeyOf(bi.title) !== Planner.bookKeyOf(bj.title), '[v190-diverse] 同じ問題集が隣り合った', { ids: ids(plan) });
+    }
+    // 候補が1種類しかない日は、空っぽにせず上限をゆるめて埋める
+    const mono = Array.from({ length: 6 }, (_, i) => mk('m' + i, '青チャート 例題' + i, 2));
+    const pm = Planner.buildTodayPlan({ tasks: mono, todayStr: today, baseCapacity: 8 });
+    assert(pm.entries.length >= 3, '[v190-diverse] 候補が1種類の日に空っぽになった', { n: pm.entries.length });
+    // 直近2日にやった問題集は、同条件なら後ろへ
+    const recentTasks = [
+      mk('r1', '青チャート 例題1', 3, { done: true, doneDate: addDays(today, -1) }),
+      mk('r2', '青チャート 例題2', 3),
+      mk('r3', '英単語 Unit9', 3),
+    ];
+    const pr = Planner.buildTodayPlan({ tasks: recentTasks, todayStr: today, baseCapacity: 3 });
+    assert(ids(pr)[0] === 'r3', '[v190-diverse] 昨日やった問題集が優先された', { ids: ids(pr) });
+    // bookKeyOf
+    assert(Planner.bookKeyOf('青チャート 例題12') === Planner.bookKeyOf('青チャート 数IIB p.40'), '[v190-diverse] 青チャートが同じ問題集にならない', {});
+    assert(Planner.bookKeyOf('英単語 Unit 3') === Planner.bookKeyOf('英単語 Unit 4'), '[v190-diverse] 番号違いが同じ問題集にならない', {});
+    assert(Planner.bookKeyOf('英単語 Unit 3') !== Planner.bookKeyOf('古文 読解'), '[v190-diverse] 別の教材が同じキーになった', {});
+  }
+
+  // --- ④ 天気（見通し）が直感的に動く ---
+  {
+    const cap = () => 10;
+    const f = (tasks, pend, done = 0) => Forecast.computePressure({ tasks, todayStr: today, capacityForDate: cap, todayPendingLoad: pend, todayCapacity: 10, alreadyDoneLoad: done }).pressure;
+    const once = (n, load, dl) => Array.from({ length: n }, (_, i) => mk('q' + i, '課題' + i, load, dl ? { deadline: dl(i) } : {}));
+    const p0 = f([], 0);
+    const pFew = f(once(3, 3), 9);
+    const pMid = f(once(10, 3), 10);
+    const pMany = f(once(40, 3), 10);
+    const pHalfDone = f(once(3, 3), 4, 5);
+    assert(p0 === 0, '[v190-sky] タスクが無いのに晴れでない', { p0 });
+    assert(pFew >= 0.2, '[v190-sky] 今日の分が満杯でも曇りにならない（旧仕様の鈍さ）', { pFew });
+    assert(pFew < pMid && pMid < pMany, '[v190-sky] 量に応じて単調に重くならない', { pFew, pMid, pMany });
+    assert(pMany <= 0.52 + 1e-9, '[v190-sky] 量だけで荒れすぎる（一括登録でずっと嵐は避ける）', { pMany });
+    assert(pMany >= 0.4, '[v190-sky] 大量に登録しても雨の気配にもならない', { pMany });
+    assert(pHalfDone < pFew, '[v190-sky] 終えても空が軽くならない', { pHalfDone, pFew });
+    const pTight = f(once(4, 6, () => addDays(today, 1)), 10);
+    assert(pTight > 0.75, '[v190-sky] 計画が破綻する締切で荒れない', { pTight });
+    // 単調性: 今日の残りが増えれば悪くなる／完了が進めば良くなる
+    let prev = -1;
+    for (let pend = 0; pend <= 12; pend++) {
+      const v = f(once(3, 3), pend);
+      assert(v >= prev - 1e-12, '[v190-sky] 今日の残りに対して単調でない', { pend, v, prev });
+      prev = v;
+    }
+    // 週次タスクが多い週は重い
+    const wk = [mk('wk', '毎日の復習', 5, { type: 'weekly', weekDays: [0, 1, 2, 3, 4, 5, 6] })];
+    assert(f(wk, 5) > f([], 0), '[v190-sky] 週次タスクが空に効かない', {});
+  }
+}
+
+console.log('=== PART J: v1.9.0（追加生成・偏り回避・週次必ず表示・天気の感度・明日期限） ===');
+testV190();
 
 console.log('\n=== 結果 ===');
 console.log(`総アサーション数: ${assertionCount}`);

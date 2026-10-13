@@ -4,27 +4,28 @@
    純粋関数のみ（DOM・保存領域に触れない。憲法6条）。
    空が映すのは「今」ではなく「今日〜3日先までの見通し」。
 
-   設計の要点:
+   設計の要点（v1.9.0 で「晴れすぎて伝わらない」ため全体にゆるめた）:
      ・荒れる条件は「計画が破綻する手前（余裕がほぼ無い）」。
        締切に対し 必要Load累積 ÷ 使える容量累積（Plannerの
        computeDeadlinePressure と同じ考え方）の比を見る。
-     ・締切の無いタスクや、遠くて余裕のある締切は荒れの理由に
-       ならない。一気に大量登録しても、期限が無理でなければ
-       ずっと嵐にはならない（曇りまで）。
-     ・近い日ほど重く（今日1.0 / 明日0.7 / 2日先0.45 / 3日先0.3）。
-     ・今日の残りLoadは小さく効かせ、タスクを終えるほど空が
+     ・締切の無いタスクでも、今日の残りと全体の量は空に出る。
+       ただし量だけでは雨（小雨あたり）まで。一気に大量登録しても、
+       期限が無理でなければずっと嵐にはならない。
+     ・近い日ほど重く（今日1.0 / 明日0.8 / 2日先0.6 / 3日先0.45）。
+     ・今日の残りLoadをはっきり効かせ、タスクを終えるほど空が
        軽くなる手応えを残す。
    評価語は使わない（憲法7条）。返すのは数値だけ。
    ============================================================ */
 import { isTaskPendingOn, computeEffectiveCapacity } from './planner.js';
 
-const DAY_WEIGHTS = [1.0, 0.7, 0.45, 0.30];
+const DAY_WEIGHTS = [1.0, 0.8, 0.6, 0.45];
+const FAR_FLOOR = 0.15;       // 4日先以降の重みの下限
 const SPAN_LIMIT = 45;        // 見る日数の上限
-const RAMP_FROM = 0.45;       // この比から空が曇り始める
-const RAMP_TO = 1.15;         // この比で最も荒れる
-const TODAY_SOFT_MAX = 0.12;  // 今日の残りLoadが空に与える上限
-const BACKLOG_SOFT_MAX = 0.06; // 未着手の総量が空に与える上限（霞〜薄曇り程度）
-const SOFT_CAP = 0.18;        // ゆるい成分の合計上限。大量登録しても「曇り」より先へは進まない
+const RAMP_FROM = 0.30;       // この比から空が曇り始める（旧0.45）
+const RAMP_TO = 1.10;         // この比で最も荒れる（旧1.15）
+const TODAY_SOFT_MAX = 0.30;  // 今日の残りLoadが空に与える上限（旧0.12）。今日が丸ごと残っていれば曇り〜厚い曇り
+const BACKLOG_SOFT_MAX = 0.30; // 未着手の総量が空に与える上限（旧0.06）。1週間分を大きく超えると雨の気配あたり
+const SOFT_CAP = 0.52;        // 量だけで進める上限。大量登録しても「小雨」より先へは進まない（旧0.18）
 
 const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
 const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a)); return t * t * (3 - 2 * t); };
@@ -87,24 +88,34 @@ export function computePressure({
       const required = items.filter((it) => it.d <= D).reduce((s, it) => s + it.load, 0);
       const ratio = required / Math.max(avail[k], 1);
       // 4日先以降も、遠いほどゆるやかに軽くする（0.3 → 下限0.12）
-      const w = k < DAY_WEIGHTS.length ? DAY_WEIGHTS[k] : Math.max(0.12, 0.3 * Math.pow(0.88, k - 3));
+      const w = k < DAY_WEIGHTS.length ? DAY_WEIGHTS[k] : Math.max(FAR_FLOOR, DAY_WEIGHTS[3] * Math.pow(0.9, k - 3));
       worstRatio = Math.max(worstRatio, ratio);
       deadline = Math.max(deadline, w * smooth(RAMP_FROM, RAMP_TO, ratio));
     });
   }
 
-  // ② 今日の残り（終えるほど軽くなる）
+  // ② 今日の残り（終えるほど軽くなる）。締切が無くても、今日の分が丸ごと残っていれば空に出る
   const todayLeft = todayCapacity > 0 ? clamp(todayPendingLoad / todayCapacity, 0, 1.2) : 0;
-  const soft1 = TODAY_SOFT_MAX * Math.pow(clamp(todayLeft), 1.2);
+  const soft1 = TODAY_SOFT_MAX * smooth(0.15, 1.10, todayLeft);
 
-  // ③ 未着手の総量（上限が低いので、大量登録でも曇りまで）
+  // ③ 未着手の総量 ÷ 1週間の容量。締切が無いタスクも数える。週次タスクは
+  //    終わりのないシリーズなので、この週に回ってくる分だけ量に足す
   const remaining = tasks.filter((t) => t.type !== 'weekly' && !t.done).reduce((s, t) => s + safeLoad(t.load), 0);
-  let week = 0;
-  for (let i = 0; i < 7; i++) week += cap(addDays(todayStr, i));
-  const q = week > 0 ? remaining / week : 0;
-  const backlog = BACKLOG_SOFT_MAX * smooth(0.3, 2.0, q);
+  let week = 0, weeklyWeek = 0;
+  for (let i = 0; i < 7; i++) {
+    const dateStr = addDays(todayStr, i);
+    week += cap(dateStr);
+    const wd = new Date(dateStr + 'T00:00:00').getDay();
+    weeklyWeek += tasks
+      .filter((t) => t.type === 'weekly' && Array.isArray(t.weekDays) && t.weekDays.includes(wd)
+        && !(t.deadline && dateStr > t.deadline) && (i > 0 || isTaskPendingOn(t, dateStr)))
+      .reduce((s, t) => s + safeLoad(t.load), 0);
+  }
+  const q = week > 0 ? (remaining + weeklyWeek) / week : 0;
+  const backlog = BACKLOG_SOFT_MAX * smooth(0.25, 2.2, q);
 
-  const soft = clamp(soft1 + backlog, 0, SOFT_CAP);
+  // 2つの成分は足さず「どちらかが重ければ重い」形で合わせる（足すと一方だけで上限に張り付く）
+  const soft = clamp(1 - (1 - soft1) * (1 - backlog), 0, SOFT_CAP);
   const pressure = clamp(deadline + (1 - deadline) * soft);
   return { pressure, deadline, todayLeft, backlog, worstRatio };
 }

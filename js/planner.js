@@ -361,6 +361,68 @@ function deadlineSortKey(task, todayStr) {
 
 const OVERDUE_MUST_INCLUDE = true; // §14: 期限が非常に近いタスクは容量計算だけで除外しない
 
+/* ------------------------------------------------------------
+   v1.9.0 の追加定数
+   ------------------------------------------------------------ */
+const SOON_DAYS = 1;                 // 明日が期限のタスクは今日のおすすめに必ず出す
+const SOON_OVERFLOW_RATIO = 0.3;     // 明日期限の前倒しは、容量の+30%まで容量を超えて入れてよい
+const PATTERN_SHARE_MAX = 0.5;       // 1日の容量のうち、同じ認知タイプが占めてよい割合
+const BOOK_TASKS_MAX = 2;            // 同じ問題集は1日2件まで
+const MIN_FILL_RATIO = 0.65;         // 多様性の上限で容量の35%以上が余る場合は、上限をゆるめて埋める
+const RECENT_DAYS = 2;               // 直近何日の完了を「最近やったもの」と見るか
+
+/* ------------------------------------------------------------
+   「同じ問題集」の近似キー
+   ------------------------------------------------------------
+   タイトルから数字・ページ・章番号などを落として、本体の名前だけを残す。
+   「青チャート 例題12」と「青チャート 例題13」は同じ問題集として扱い、
+   よく使われる教材名が含まれていれば、その教材名そのものをキーにする
+   （「青チャート 数IA」と「青チャート 数IIB」も同じ問題集）。
+   ------------------------------------------------------------ */
+const BOOK_HINTS = [
+  '青チャート', '黄チャート', '白チャート', '赤チャート', 'フォーカスゴールド', 'focus gold', '1対1対応',
+  'ターゲット', 'システム英単語', 'シス単', '鉄壁', '速読英単語', 'ネクステージ', 'next stage', 'vintage',
+  '基礎問題精講', '標準問題精講', '過去問', '共通テスト', 'リード', '大学入試',
+];
+export function bookKeyOf(title) {
+  const s = normalizeText(title);
+  for (const h of BOOK_HINTS) {
+    const hn = normalizeText(h);
+    if (s.includes(hn)) return hn;
+  }
+  const stripped = s
+    .replace(/第?[0-9]+(章|節|回|問|課|講|周|週|日目)?/g, '')
+    .replace(/(p|pp)\.?\s*[0-9]+/g, '')
+    .replace(/[~〜\-ー–—_・,.、。()（）【】\[\]#:：/／]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return stripped || s;
+}
+
+/** 今日済み／直近RECENT_DAYS日に済んだタスクの、認知タイプ・問題集ごとの件数（Plannerが tasks だけから数える） */
+function countFinished(tasks, todayStr) {
+  const out = { today: { patterns: {}, books: {} }, recent: { patterns: {}, books: {} } };
+  const recentFrom = addDays(todayStr, -RECENT_DAYS);
+  const bump = (bucket, t) => {
+    const p = t.pattern || estimatePatternGeneral(t.title, t.description);
+    const b = bookKeyOf(t.title);
+    bucket.patterns[p] = (bucket.patterns[p] || 0) + 1;
+    bucket.books[b] = (bucket.books[b] || 0) + 1;
+  };
+  tasks.forEach((t) => {
+    if (t.type === 'weekly') {
+      (Array.isArray(t.doneDates) ? t.doneDates : []).forEach((d) => {
+        if (d === todayStr) bump(out.today, t);
+        else if (d >= recentFrom && d < todayStr) bump(out.recent, t);
+      });
+    } else if (t.done && t.doneDate) {
+      if (t.doneDate === todayStr) bump(out.today, t);
+      else if (t.doneDate >= recentFrom && t.doneDate < todayStr) bump(out.recent, t);
+    }
+  });
+  return out;
+}
+
 /**
  * @param {object} args
  * @param {Array} args.tasks 全タスク（完了/未完了問わず、履歴推定に使う）
@@ -373,15 +435,25 @@ const OVERDUE_MUST_INCLUDE = true; // §14: 期限が非常に近いタスクは
  * @param {(dateStr:string)=>number} [args.capacityForDate] 日ごとの容量。渡すと締切への間に合い具合（computeDeadlinePressure）による前倒しが効く。省略時は無効
  * @param {Array} [args.patternHistory] Pattern個人補正用の完了/登録履歴 [{title, pattern}]
  * @param {number} [args.alreadyDoneLoad] 今日すでに完了した分のLoad合計（省略時0）。
- *   今日の残り選定が「まだ使っていない容量」の中で行われるようにするための
- *   もので、これを渡さないと「完了後にキャパシティを変更すると合計が容量を
- *   超えて見える」不具合が起きる（詳しくはbuildTodayPlan本体のコメント参照）。
+ *   今日の残り選定が「まだ使っていない容量」の中で行われるようにするためのもので、
+ *   これを渡さないと「完了後にキャパシティを変更すると合計が容量を超えて見える」不具合が起きる。
+ * @param {number} [args.capacityBonus] 「追加で生成」で足された、今日だけの上乗せ容量（既定0）
+ * @param {string[]|null} [args.pinIds] 今日すでに決めた並び（タスクID）。あれば、その選定と並びを
+ *   なるべく保ったまま、足りない分・新しく入ったタスクだけを差し込む（毎回選び直さない）
+ * @param {number|null} [args.pinCapacity] pinIdsを保存した時点の今日の容量(totalCapacity)。今の容量がこれより
+ *   下がっているときだけ、保存済みの選定を後ろから外す。下がっていなければ、期限が近い・週次などで
+ *   新しく入るものがあっても、すでに決めた選定は外さない（コロコロ入れ替えない）
+ * @param {boolean} [args.forceExtra] 「追加で生成」用。上乗せ容量に収まらなくても、候補が残っていれば最低1件は追加する
+ * @param {boolean} [args.diversity] 認知タイプ・問題集の偏り回避（既定true。検証用に切れる）
  * @returns {{
  *   entries: Array<{id, load, pattern, deadline, src, overCapacity:boolean}>,
- *   effectiveCapacity: number,
- *   fullCapacity: number,
+ *   effectiveCapacity: number,   // まだ使っていない残り予算（上乗せ込み）
+ *   fullCapacity: number,        // 曜日補正後の今日1日の目標容量（上乗せを含まない）
+ *   totalCapacity: number,       // fullCapacity + capacityBonus（表示の分母）
  *   totalLoad: number,
- *   reason: object  // デバッグ・履歴用の内部情報（§5, §18）
+ *   pinIds: string[],            // 呼び出し側が保存しておく、今日の並び
+ *   extraCount: number,          // まだ選ばれていない候補の数（「追加で生成」を出せるか）
+ *   reason: object
  * }}
  */
 export function buildTodayPlan({
@@ -395,27 +467,27 @@ export function buildTodayPlan({
   capacityForDate = null,
   patternHistory = [],
   alreadyDoneLoad = 0,
+  capacityBonus = 0,
+  pinIds = null,
+  pinCapacity = null,
+  forceExtra = false,
+  diversity = true,
 }) {
   const weekday = new Date(todayStr + 'T00:00:00').getDay();
-  // fullCapacity: 曜日補正等を経た「今日1日の目標容量」。表示上の分母は
-  // これを使う（完了済みの分を差し引く前の、1日を通じての目標値）。
   const fullCapacity = computeEffectiveCapacity(baseCapacity, { weekday, weekdayStats });
-  // effectiveCapacity: 「まだ使っていない残り予算」。今日すでに完了した分
-  // (alreadyDoneLoad)をfullCapacityから差し引いておくことで、これから
-  // 選ぶ（強制採用+充填）タスクの合計が、既に完了した分と合わせて
-  // fullCapacityにきちんと収まるようにする。
-  //
-  // これを差し引かずにfullCapacityそのものを使って毎回選び直すと、
-  // 「完了させた分」が考慮されないまま新しい容量いっぱいまで残りタスクが
-  // 選ばれてしまい、(doneLoad + 新しく選ばれた分) が 新しい容量を超えて
-  // 「16/15」のような一見おかしな表示になる（完了後にキャパシティを
-  // 変更すると発生した不具合の直接の原因）。
+  const bonus = Number.isFinite(capacityBonus) && capacityBonus > 0 ? Math.round(capacityBonus) : 0;
+  const totalCapacity = fullCapacity + bonus;
+  // effectiveCapacity: 「まだ使っていない残り予算」。今日すでに完了した分(alreadyDoneLoad)を
+  // 差し引いておくことで、これから選ぶ分の合計が、既に完了した分と合わせて今日の容量に
+  // きちんと収まるようにする（差し引かないと「16/15」のような表示になる。完了後に
+  // キャパシティを変更すると発生した不具合の直接の原因）。
   const doneLoadSafe = Number.isFinite(alreadyDoneLoad) && alreadyDoneLoad > 0 ? alreadyDoneLoad : 0;
-  const effectiveCapacity = Math.max(0, fullCapacity - doneLoadSafe);
+  const effectiveCapacity = Math.max(0, totalCapacity - doneLoadSafe);
 
   const candidates = buildCandidates(tasks, todayStr).map((t) => ({
     ...t,
     _pattern: t.pattern || estimatePattern(t.title, t.description, patternHistory),
+    _book: bookKeyOf(t.title),
     _daysUntil: deadlineSortKey(t, todayStr),
   }));
 
@@ -426,94 +498,161 @@ export function buildTodayPlan({
   });
 
   let usedLoad = 0;
+  const entryById = new Map();
 
-  // §14: 期限超過・本日期限は容量に関わらず必ず含める
+  // ① §14: 期限超過・本日期限は容量に関わらず必ず含める。
+  //    overCapacityだけは、並びが確定した後（表示順）でまとめて計算し直す。
   const mustInclude = candidates.filter((t) => t._daysUntil <= 0);
-  const rest = candidates.filter((t) => t._daysUntil > 0);
-
-  // 強制採用分のentryをここで確定する（src は期限の近さで決まるものなので
-  // 並べ替えの前に固定してよい）。
-  //
-  // overCapacityだけは、この時点ではまだ決めない。以前はここで
-  // 「mustIncludeの期限順」における累積Loadから判定していたが、
-  // ユーザーが実際に目にする並びは後段のorderToAvoidRuns（Pattern連続・
-  // Load偏り回避）を経た「表示順」であり、両者は一致するとは限らない
-  // （例えば期限順では3番目だったタスクが、Pattern分散のため表示上は
-  // 1番目に来ることがある）。overCapacityは「表示順で見ていったとき、
-  // どのタスクから容量を超えるか」を表す値であるべきなので、最終的な
-  // 表示順が確定した後（ordered確定後）にまとめて計算し直す。
-  const forcedEntryById = new Map();
   mustInclude.forEach((t) => {
-    const entry = toEntry(t, t._daysUntil < 0 ? 'overdue' : 'today_deadline', false);
+    entryById.set(t.id, toEntry(t, t._daysUntil < 0 ? 'overdue' : 'today_deadline', false));
     usedLoad += safeLoad(t.load);
-    forcedEntryById.set(t.id, entry);
   });
 
-  // 残り容量への充填（§11〜§13: 優先度そのままではなく、組み合わせを調整する）。
-  //
-  // 単純な「毎回そのステップのベスト1件を選ぶ」貪欲法は、Loadの大きい
-  // タスクが先に選ばれて残り容量を中途半端に使い切り、複数の小さい
-  // タスクが同時に入れられたはずの余地を潰してしまう問題がある
-  // （例: 容量8に対しLoad5を1件選ぶと、Load2+Load3の2件が入る余地が
-  // 残っているのに試されずに終わる）。
-  //
-  // これを避けるため、まず「基礎スコア」（期限の近さ + 曜日/Pattern補正、
-  // Pattern連続・Load偏りのペナルティは含まない静的な値）を各候補に付け、
-  // 容量内で基礎スコア合計を最大化する組み合わせを部分和的に探索する
-  // （候補数が小さい実用範囲を前提とした軽量なナップサック法）。
-  // 同じ達成価値なら「件数が多い組み合わせ」を優先し、無駄な容量の
-  // 使い残しを避ける。
-  // 締切への間に合い具合（capacityForDateが渡された時だけ有効）。
-  // 期限まで遠く deadlineScore が0でも、窓全体が容量に対して重い場合は
-  // 前倒しで進めるよう価値を上げる（受験向け③）。
+  // ② 週次タスクは「今日がその曜日で、まだ済んでいない」なら必ず出す。
+  //    以前はナップサックの一候補にすぎず、価値が低いため容量が埋まると落ちていた。
+  //    終わりのないシリーズなので、期限の強制採用とは別枠で、容量を先に消費する。
+  const weeklyTasks = candidates.filter((t) => t.type === 'weekly');
+  weeklyTasks.forEach((t) => {
+    entryById.set(t.id, toEntry(t, 'weekly', false));
+    usedLoad += safeLoad(t.load);
+  });
+
+  // 締切への間に合い具合（capacityForDateが渡された時だけ有効）
   const pressureById = capacityForDate
     ? computeDeadlinePressure({ tasks, todayStr, capacityForDate, weekdayStats, alreadyDoneLoad: doneLoadSafe })
     : new Map();
 
-  const scored = rest.map((t) => {
+  // 今日・直近に済んだものの偏り（同じ認知タイプ・問題集が続かないように）
+  const finished = diversity ? countFinished(tasks, todayStr) : null;
+
+  const decided0 = new Set(entryById.keys());
+  const undecided = candidates.filter((t) => !decided0.has(t.id));
+  const scored = undecided.map((t) => {
     const deadlineScore = t._daysUntil === Infinity ? 0 : Math.max(0, 60 - t._daysUntil * 3);
     const weekdayBonus = weekdayPatternBonus(t._pattern, weekday, weekdayPatternStats);
     const timeBonus = timeOfDayPatternBonus(t._pattern, timeOfDay, timeOfDayPatternStats);
     const phaseBonus = deadlinePhaseBonus(t._pattern, t._daysUntil);
     const pressureBonus = pressureBonusOf(pressureById.get(t.id));
+    // 直近2日に同じ問題集・認知タイプをやっていたら、少しだけ後ろへ（期限の近さは覆さない小さな重み）
+    let recentPenalty = 0;
+    if (finished) {
+      recentPenalty += Math.min(8, 3 * (finished.recent.books[t._book] || 0));
+      recentPenalty += Math.min(4, 1.2 * (finished.recent.patterns[t._pattern] || 0));
+    }
     return {
       task: t, deadlineScore, weekdayBonus, timeBonus, phaseBonus, pressureBonus,
-      value: Math.max(0.01, deadlineScore + weekdayBonus + timeBonus + phaseBonus + pressureBonus + 1), // +1: 期限なしタスクにも僅かな基礎価値を与える
+      value: Math.max(0.01, deadlineScore + weekdayBonus + timeBonus + phaseBonus + pressureBonus - recentPenalty + 1), // +1: 期限なしタスクにも僅かな基礎価値を与える
     };
   });
-  // 選定理由の説明（explainSelection）が実際の判断根拠を正確に言い表せる
-  // よう、taskごとのdeadlineScore/weekdayBonus/timeBonusを引けるようにしておく。
-  // knapsackSelect自体はtask本体しか返さないため、このMapを経由する。
   const scoreInfoById = new Map(scored.map((s) => [s.task.id, { deadlineScore: s.deadlineScore, weekdayBonus: s.weekdayBonus, timeBonus: s.timeBonus, phaseBonus: s.phaseBonus, pressureBonus: s.pressureBonus, phase: deadlinePhaseOf(s.task._daysUntil) }]));
+  const scoredById = new Map(scored.map((s) => [s.task.id, s]));
 
-  const remainingCapacity = Math.max(0, effectiveCapacity - usedLoad);
-  const chosenSet = knapsackSelect(scored, remainingCapacity);
-
-  const filledEntryById = new Map();
-  chosenSet.forEach((t) => {
-    // 週次タスクは「期限が近いから」ではなく「今日がその曜日だから」
-    // 選ばれているため、詳細画面の理由もそれに合わせて区別する。
-    filledEntryById.set(t.id, toEntry(t, t.type === 'weekly' ? 'weekly' : 'filled', false, scoreInfoById.get(t.id)));
+  // ③ すでに決めてある今日の選定（pinIds）は、そのまま保つ。
+  //    タスクを足すたびに全部選び直すと、見慣れた並びがコロコロ入れ替わって落ち着かない。
+  //    外れるのは、ユーザーが容量を下げたときだけ（後ろのものから）。期限が近いタスクや
+  //    週次が新しく入っても、すでに決めた分は押し出さない。
+  const isSoon = (t) => t.type !== 'weekly' && t._daysUntil > 0 && t._daysUntil <= SOON_DAYS;
+  const pinnedKept = [];
+  if (Array.isArray(pinIds) && pinIds.length) {
+    const lowered = Number.isFinite(pinCapacity) && totalCapacity < pinCapacity;
+    let room = Math.max(0, effectiveCapacity - usedLoad);
+    pinIds.forEach((id) => {
+      const s = scoredById.get(id);
+      if (!s || isSoon(s.task)) return; // 明日期限になったものは次のブロックで必ず入る
+      const l = safeLoad(s.task.load);
+      if (!lowered || l <= room) {
+        room -= l;
+        pinnedKept.push(s.task);
+      }
+    });
+  }
+  pinnedKept.forEach((t) => {
+    entryById.set(t.id, toEntry(t, 'filled', false, scoreInfoById.get(t.id)));
     usedLoad += safeLoad(t.load);
   });
 
-  // 確定した組み合わせ（強制採用分＋充填分）の「並び」を、Pattern連続・
-  // Load偏りを避けるように最適化する（§12, §13）。
-  //
-  // 以前は充填分（chosenSet）だけを並べ替えの対象にしており、強制採用分
-  // （mustInclude）同士や、強制採用分と充填分の継ぎ目でのPattern連続は
-  // 一切調整されていなかった。強制採用は「必ず含める」という選択の話で
-  // あり、並びの最適化とは独立した問題（§12, §13の分離の考え方そのもの）
-  // なので、強制採用分も含めた全体を並べ替え対象にする。含めるかどうか
-  // （どのタスクが選ばれるか）はここでは一切変えていない。
-  const combinedForOrdering = [...mustInclude, ...chosenSet];
-  const ordered = orderToAvoidRuns(combinedForOrdering, null);
-  const entries = ordered.map((t) => forcedEntryById.get(t.id) || filledEntryById.get(t.id));
+  // ④ 明日が期限のタスクは、今日のおすすめに必ず出す（容量の+30%までは超えて入れる）。
+  //    入れ方は「今日の容量が空いていれば普通に」「満杯でも一定量までは前倒し」。
+  //    超える分は、明日以降に「本日期限」として必ず出るのでここでは諦める。
+  const soonCands = candidates.filter((t) => isSoon(t));
+  // 明日期限は、いま空いている容量に加えて+30%を専用の枠として持つ。さらに、枠に収まらなくても
+  // 最初の1件（期限が同じならLoadの大きいもの）は必ず入れる。「入れたのに出てこない」を無くすため。
+  const soonBudget = Math.max(0, effectiveCapacity - usedLoad) + Math.ceil(totalCapacity * SOON_OVERFLOW_RATIO);
+  let soonLoad = 0;
+  const soonPending = [];
+  soonCands.forEach((t) => {
+    const l = safeLoad(t.load);
+    if (soonLoad === 0 || soonLoad + l <= soonBudget) {
+      entryById.set(t.id, toEntry(t, 'soon', false));
+      usedLoad += l;
+      soonLoad += l;
+    } else {
+      soonPending.push(t);
+    }
+  });
+
+  // 期限が近いものや週次が後から入ってきても、今日の合計が「容量+30%」を超えない範囲までしか
+  // 膨らませない。超える分は、すでに決めた選定のうち一番後ろ（優先度の低い）ものから外す。
+  // （強制採用・週次・明日期限そのものは外さない）
+  const totalCeiling = effectiveCapacity + Math.ceil(totalCapacity * SOON_OVERFLOW_RATIO);
+  for (let i = pinnedKept.length - 1; i >= 0 && usedLoad > totalCeiling; i--) {
+    const t = pinnedKept[i];
+    entryById.delete(t.id);
+    usedLoad -= safeLoad(t.load);
+    pinnedKept.splice(i, 1);
+  }
+
+  // ⑤ 残り容量を充填（§11〜§13）。認知タイプ・問題集が偏らない範囲で価値を最大化する。
+  const pool = scored.filter((s) => !entryById.has(s.task.id));
+  const remainingCapacity = Math.max(0, effectiveCapacity - usedLoad);
+
+  // 偏りの上限は「すでに今日の枠に入っているもの＋今日済んだもの」を含めて数える
+  const baseCounts = { patterns: {}, books: {}, patternLoad: {} };
+  const countInto = (t) => {
+    baseCounts.patterns[t._pattern] = (baseCounts.patterns[t._pattern] || 0) + 1;
+    baseCounts.patternLoad[t._pattern] = (baseCounts.patternLoad[t._pattern] || 0) + safeLoad(t.load);
+    baseCounts.books[t._book] = (baseCounts.books[t._book] || 0) + 1;
+  };
+  candidates.filter((t) => entryById.has(t.id)).forEach(countInto);
+  if (finished) {
+    Object.entries(finished.today.patterns).forEach(([p, c]) => { baseCounts.patterns[p] = (baseCounts.patterns[p] || 0) + c; });
+    Object.entries(finished.today.books).forEach(([b, c]) => { baseCounts.books[b] = (baseCounts.books[b] || 0) + c; });
+  }
+
+  let chosenSet = diversity
+    ? selectDiverse(pool, remainingCapacity, baseCounts, totalCapacity)
+    : knapsackSelect(pool, remainingCapacity);
+
+  // 「追加で生成」: 上乗せ容量に収まる候補が無くても、最低1件は出す
+  if (forceExtra && !chosenSet.length && pool.length) {
+    const best = [...pool].sort((a, b) => b.value - a.value || safeLoad(a.task.load) - safeLoad(b.task.load))[0];
+    chosenSet = [best.task];
+  }
+  chosenSet.forEach((t) => {
+    entryById.set(t.id, toEntry(t, 'filled', false, scoreInfoById.get(t.id)));
+    usedLoad += safeLoad(t.load);
+  });
+
+  // ⑥ 並び。初回は Pattern連続・Load偏り・同じ問題集の連続を避ける最適化、
+  //    2回目以降は前回の並びを保ち、新しく入ったものだけを一番収まりのよい位置へ差し込む。
+  const allTasks = candidates.filter((t) => entryById.has(t.id));
+  const allIds = new Set(allTasks.map((t) => t.id));
+  let ordered;
+  const prior = Array.isArray(pinIds) ? pinIds.filter((id) => allIds.has(id)) : [];
+  if (prior.length) {
+    const byId = new Map(allTasks.map((t) => [t.id, t]));
+    ordered = prior.map((id) => byId.get(id));
+    const inserted = allTasks.filter((t) => !prior.includes(t.id));
+    // 期限が近いもの（強制採用・明日期限）は先頭寄りに、他は隣と相性のよい位置へ
+    inserted.sort((a, b) => urgencyRank(a) - urgencyRank(b));
+    inserted.forEach((t) => { ordered = insertAtBestPosition(ordered, t); });
+  } else {
+    ordered = improveOrder(orderToAvoidRuns(allTasks, null));
+  }
+  const entries = ordered.map((t) => entryById.get(t.id));
 
   // overCapacityの確定（表示順で見ていったときの強制採用分の累積Loadが
-  // effectiveCapacityを超えた時点からtrueにする。上のコメント参照）。
-  // 充填分(filled/weekly)は常にfalseのまま（元々effectiveCapacity内に
-  // 収まるよう選ばれているため）。
+  // effectiveCapacityを超えた時点からtrueにする）。週次・明日期限・充填分は常にfalse。
   let runningForced = 0;
   entries.forEach((e) => {
     if (e.src === 'overdue' || e.src === 'today_deadline') {
@@ -522,18 +661,148 @@ export function buildTodayPlan({
     }
   });
 
+  const chosenIds = new Set(entries.map((e) => e.id));
+  const extraCount = candidates.filter((t) => !chosenIds.has(t.id)).length;
+
   return {
     entries,
     effectiveCapacity,
     fullCapacity,
+    totalCapacity,
     totalLoad: usedLoad,
+    pinIds: entries.map((e) => e.id),
+    extraCount,
     reason: {
       weekday,
       candidateCount: candidates.length,
       mustIncludeCount: mustInclude.length,
+      weeklyCount: weeklyTasks.length,
+      soonCount: soonCands.length - soonPending.length,
       capacityOverridden: entries.some((e) => e.overCapacity),
     },
   };
+}
+
+function urgencyRank(t) {
+  if (t._daysUntil <= 0) return 0;
+  if (t.type === 'weekly') return 2;
+  if (t._daysUntil <= SOON_DAYS) return 1;
+  return 3;
+}
+
+/* ------------------------------------------------------------
+   並びの「隣り合わせの悪さ」（小さいほどよい）
+   ------------------------------------------------------------
+   優先順位は 認知タイプの連続（最悪）＞ 同じ問題集の連続 ＞ 近い処理特性 ＞ 高負荷の連続。
+   認知タイプの連続は他の何を犠牲にしても増やさない（桁を分けて辞書式に比べる）。
+   ------------------------------------------------------------ */
+function adjacencyCost(a, b) {
+  if (!a || !b) return 0;
+  let c = 0;
+  if (a._pattern && a._pattern === b._pattern) c += 100000;
+  else c += patternAdjacencyPenalty(a._pattern, b._pattern) * 10;
+  if (a._book && a._book === b._book) c += 3000;
+  c += loadRunPenaltyForValues(safeLoad(a.load), safeLoad(b.load)) * 10;
+  return c;
+}
+
+function orderCost(list) {
+  let c = 0;
+  for (let i = 0; i + 1 < list.length; i++) c += adjacencyCost(list[i], list[i + 1]);
+  return c;
+}
+
+function insertAtBestPosition(list, task) {
+  const urgent = urgencyRank(task) <= 1;
+  const costAt = (i) => {
+    const cand = [...list.slice(0, i), task, ...list.slice(i)];
+    // 期限が迫っているものは、相性が同程度なら前へ
+    return orderCost(cand) + (urgent ? i * 20 : 0) + (i === 0 ? safeLoad(task.load) * 0.5 : 0);
+  };
+  let bestIdx = list.length, bestCost = Infinity;
+  for (let i = 0; i <= list.length; i++) {
+    const c = costAt(i);
+    if (c < bestCost) { bestCost = c; bestIdx = i; }
+  }
+  // 急ぎでないものは、末尾に置いて同じ認知タイプ・問題集が隣り合わないなら末尾へ（既存の並びを動かさない）
+  if (!urgent && costAt(list.length) - bestCost < 2500) bestIdx = list.length;
+  return [...list.slice(0, bestIdx), task, ...list.slice(bestIdx)];
+}
+
+/** 2件の入れ替えで隣り合わせの悪さが減る限り改善する（件数は小さいので総当たりで十分） */
+function improveOrder(list) {
+  const out = [...list];
+  if (out.length < 3) return out;
+  let best = orderCost(out);
+  for (let pass = 0; pass < 6; pass++) {
+    let improved = false;
+    for (let i = 0; i < out.length; i++) {
+      for (let j = i + 1; j < out.length; j++) {
+        [out[i], out[j]] = [out[j], out[i]];
+        const c = orderCost(out);
+        if (c < best - 1e-9) { best = c; improved = true; }
+        else [out[i], out[j]] = [out[j], out[i]];
+      }
+    }
+    if (!improved) break;
+  }
+  return out;
+}
+
+/**
+ * 認知タイプ・問題集が偏らないように、容量内で価値を最大化する。
+ * ------------------------------------------------------------
+ * 上限: 同じ認知タイプは今日の容量の半分まで（最低1件は可）、同じ問題集は2件まで。
+ * 今日すでに済んだ分と、今日の枠にすでに入っている分も数える。
+ * 通常のナップサックを解き、上限を超えた分は価値の低い順に除いて解き直す。
+ * それでも容量の35%以上が余るなら、一日が空っぽにならないよう上限をゆるめて埋める
+ * （「できる限り」避ける、であって、候補が偏っている日に何も出さないことはしない）。
+ */
+function selectDiverse(pool, capacity, base, totalCapacity) {
+  const cap = Math.max(0, Math.floor(capacity));
+  if (cap <= 0 || !pool.length) return [];
+  const patternLoadMax = Math.max(1, Math.floor(totalCapacity * PATTERN_SHARE_MAX));
+  const excluded = new Set();
+  let chosen = [];
+  for (let iter = 0; iter < 24; iter++) {
+    const live = pool.filter((s) => !excluded.has(s.task.id));
+    chosen = knapsackSelectScored(live, cap);
+    // 上限を超えている集まりを探し、その中で価値の低いものを1件除く
+    const byPattern = new Map(), byBook = new Map();
+    chosen.forEach((s) => {
+      const p = s.task._pattern, b = s.task._book;
+      if (!byPattern.has(p)) byPattern.set(p, []);
+      byPattern.get(p).push(s);
+      if (!byBook.has(b)) byBook.set(b, []);
+      byBook.get(b).push(s);
+    });
+    let victim = null;
+    byPattern.forEach((list, p) => {
+      const load = (base.patternLoad[p] || 0) + list.reduce((sum, s) => sum + safeLoad(s.task.load), 0);
+      const hasOther = (base.patterns[p] || 0) > 0 || list.length > 1;
+      if (load > patternLoadMax && hasOther) {
+        const v = [...list].sort((a, b) => a.value - b.value)[0];
+        if (!victim || v.value < victim.value) victim = v;
+      }
+    });
+    byBook.forEach((list, b) => {
+      const n = (base.books[b] || 0) + list.length;
+      if (n > BOOK_TASKS_MAX) {
+        const v = [...list].sort((a, b2) => a.value - b2.value)[0];
+        if (!victim || v.value < victim.value) victim = v;
+      }
+    });
+    if (!victim) break;
+    excluded.add(victim.task.id);
+  }
+  const used = chosen.reduce((s, x) => s + safeLoad(x.task.load), 0);
+  const left = cap - used;
+  if (left >= Math.ceil(cap * (1 - MIN_FILL_RATIO)) && excluded.size) {
+    const chosenIds = new Set(chosen.map((s) => s.task.id));
+    const extra = knapsackSelectScored(pool.filter((s) => !chosenIds.has(s.task.id)), left);
+    chosen = chosen.concat(extra);
+  }
+  return chosen.map((s) => s.task);
 }
 
 /**
@@ -546,14 +815,15 @@ export function buildTodayPlan({
  * @param {number} capacity 残り容量（Loadと同じ整数スケール、負なら0扱い）
  * @returns {Array<object>} 選ばれたタスクの配列
  */
-function knapsackSelect(scored, capacity) {
+function knapsackSelectScored(scored, capacity) {
   const cap = Math.max(0, Math.floor(capacity));
   if (cap <= 0 || !scored.length) return [];
 
   // dp[c] = { value, count, items } — 容量cちょうど以下で達成できる最良の組み合わせ
   const dp = new Array(cap + 1).fill(null).map(() => ({ value: 0, count: 0, items: [] }));
 
-  scored.forEach(({ task, value }) => {
+  scored.forEach((entry) => {
+    const { task, value } = entry;
     const load = safeLoad(task.load);
     for (let c = cap; c >= load; c--) {
       const prev = dp[c - load];
@@ -564,7 +834,7 @@ function knapsackSelect(scored, capacity) {
         candidateValue > cur.value + 1e-9 ||
         (Math.abs(candidateValue - cur.value) <= 1e-9 && candidateCount > cur.count);
       if (better) {
-        dp[c] = { value: candidateValue, count: candidateCount, items: [...prev.items, task] };
+        dp[c] = { value: candidateValue, count: candidateCount, items: [...prev.items, entry] };
       }
     }
   });
@@ -580,6 +850,11 @@ function knapsackSelect(scored, capacity) {
     if (better) best = cand;
   }
   return best.items;
+}
+
+/** knapsackSelectScored のタスク版（選ばれたタスク本体の配列を返す） */
+function knapsackSelect(scored, capacity) {
+  return knapsackSelectScored(scored, capacity).map((s) => s.task);
 }
 
 /**
@@ -908,6 +1183,8 @@ export function explainSelection(entry) {
     parts.push('期限を過ぎているため');
   } else if (entry.src === 'today_deadline') {
     parts.push('今日が期限のため');
+  } else if (entry.src === 'soon') {
+    parts.push('明日が期限のため');
   } else if (entry.src === 'weekly') {
     parts.push('毎週この曜日に行うタスクのため');
   } else {

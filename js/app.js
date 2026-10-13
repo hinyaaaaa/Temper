@@ -24,7 +24,7 @@ let editingTaskId = null;
 let pendingImport = null;  // インポート確認中のデータ
 
 /** 設定タブに小さく表示するだけの表示用バージョン。改修のたびに上げる。 */
-const APP_VERSION = 'v1.8.0';
+const APP_VERSION = 'v1.9.0';
 
 const todayStr = () => {
   const d = new Date();
@@ -62,8 +62,49 @@ function computeDoneLoadToday(dateStr) {
    （例: 16/15）を避けるため。Planner側は「まだ使っていない予算」の
    中だけで残りのタスクを選ぶので、二重に容量を使うことがない。
    ------------------------------------------------------------ */
-function recomputeTodayPlan() {
+/* ------------------------------------------------------------
+   今日の選定の固定（pin）と「追加で生成」
+   ------------------------------------------------------------
+   タスクを足す・容量を触るたびに今日のおすすめを全部選び直すと、
+   見慣れた並びがコロコロ入れ替わって落ち着かない。そこで、その日に
+   一度決めた選定と並び(ids)を端末内に持ち、再計算ではそれを保ったまま
+   「新しく入るべきもの」（期限が近い・週次・追加分）だけを差し込む。
+   bonus は「追加で生成」で足した、今日だけの上乗せ容量。
+   日付が変われば作り直す。state・バックアップには含めない（その日限りの派生値）。
+   ------------------------------------------------------------ */
+const PLAN_PIN_KEY = 'temper-plan-pin';
+let planPin = null; // { date, ids: string[], bonus: number, cap: number|null }
+
+function loadPlanPin(today) {
+  if (planPin && planPin.date === today) return planPin;
+  try {
+    const v = JSON.parse(localStorage.getItem(PLAN_PIN_KEY) || 'null');
+    if (v && v.date === today && Array.isArray(v.ids)) {
+      planPin = {
+        date: today,
+        ids: v.ids.filter((x) => typeof x === 'string'),
+        bonus: Number.isFinite(v.bonus) && v.bonus > 0 ? Math.round(v.bonus) : 0,
+        cap: Number.isFinite(v.cap) ? v.cap : null, // 保存した時点の今日の容量。これより下がったときだけ選定を絞る
+      };
+      return planPin;
+    }
+  } catch (e) { /* 読めなければ作り直す */ }
+  planPin = { date: today, ids: [], bonus: 0, cap: null };
+  return planPin;
+}
+function savePlanPin() {
+  try { localStorage.setItem(PLAN_PIN_KEY, JSON.stringify(planPin)); } catch (e) { /* 保存できなくても動く */ }
+}
+
+/** 「追加で生成」で1回に足す容量。今日の目標容量の約4割（最低2） */
+function extraBudgetFor(fullCapacity) {
+  return Math.max(2, Math.round(fullCapacity * 0.4));
+}
+
+function recomputeTodayPlan({ forceExtra = false } = {}) {
   const today = todayStr();
+  const pin = loadPlanPin(today);
+  const doneLoad = computeDoneLoadToday(today);
   currentTodayPlan = Planner.buildTodayPlan({
     tasks: state.tasks,
     todayStr: today,
@@ -77,9 +118,46 @@ function recomputeTodayPlan() {
     }),
     capacityForDate: (dateStr) => Store.getCapacityFor(state, dateStr),
     patternHistory: Store.derivePatternHistory(state),
-    alreadyDoneLoad: computeDoneLoadToday(today),
+    alreadyDoneLoad: doneLoad,
+    capacityBonus: pin.bonus,
+    pinIds: pin.ids,
+    pinCapacity: pin.cap,
+    forceExtra,
   });
   currentPlanDate = today;
+
+  // 並びを保存する。今日すでに済んだタスクのidも残しておく（完了を取り消したとき、
+  // 元の位置に戻れるように。済んだものは候補から外れるのでplanには出てこない）。
+  const keptDone = pin.ids.filter((id) => !currentTodayPlan.pinIds.includes(id) && isTaskDoneToday(id, today));
+  pin.ids = [...currentTodayPlan.pinIds, ...keptDone];
+  // 追加分が現在の容量を超えて入ったときは、上乗せ容量を実際の量まで引き上げる
+  // （そうしないと次の再計算で、その追加分が容量超過として外れてしまう）。
+  // 引き上げたら、表示の分母がずれないよう、そのまま計算し直す。
+  let bonusRaised = false;
+  if (forceExtra) {
+    const pendingLoad = currentTodayPlan.entries.reduce((sum, e) => sum + e.load, 0);
+    const needed = doneLoad + pendingLoad - currentTodayPlan.fullCapacity;
+    if (needed > pin.bonus) { pin.bonus = needed; bonusRaised = true; }
+  }
+  pin.cap = currentTodayPlan.fullCapacity + pin.bonus;
+  savePlanPin();
+  if (bonusRaised) recomputeTodayPlan();
+}
+
+/**
+ * 「追加で生成」: 今日の負荷を達成したあと、続けてやりたい人のために
+ * 上乗せ容量を足して、残っている候補から追加で選ぶ。
+ */
+function generateExtra() {
+  const today = todayStr();
+  if (!currentTodayPlan || currentPlanDate !== today) recomputeTodayPlan();
+  const pin = loadPlanPin(today);
+  pin.bonus += extraBudgetFor(currentTodayPlan.fullCapacity);
+  const before = new Set(currentTodayPlan.entries.map((e) => e.id));
+  recomputeTodayPlan({ forceExtra: true });
+  render();
+  const added = currentTodayPlan.entries.filter((e) => !before.has(e.id)).length;
+  showToast(added ? `${added}件を追加しました` : '追加できるタスクはありません');
 }
 
 /**
@@ -206,7 +284,7 @@ function renderTodayPage() {
   // Plannerが残りタスクを選ぶ際に使った「まだ使っていない予算」
   // （fullCapacityからdoneLoadを引いたもの）なので、表示の分母には使わない
   // — これを分母にすると、完了が進むほど分母が縮んでいく不自然な表示になる。
-  const capacity = plan.fullCapacity;
+  const capacity = plan.totalCapacity; // 今日の目標容量 + 「追加で生成」で足した上乗せ分
 
   const C = 2 * Math.PI * 23;
   const frac = (v) => (capacity > 0 ? Math.min(1, v / capacity) : 0);
@@ -223,6 +301,13 @@ function renderTodayPage() {
   } else {
     taskListHtml = pendingEntries.map((entry) => renderTaskCard(entry)).join('');
   }
+
+  // 今日の負荷を達成したら（または今日の分を全部終えたら）、残りの候補から追加で生成できる。
+  // 候補がもう無ければ出さない。
+  const goalReached = capacity > 0 && doneLoad >= capacity;
+  const extraButtonHtml = (goalReached || (!pendingEntries.length && doneLoad > 0)) && plan.extraCount > 0
+    ? `<button class="btn btn-secondary btn-full extra-btn" onclick="Temper.generateExtra()">追加で生成する</button>`
+    : '';
 
   return `
     <div class="page-head">
@@ -246,6 +331,7 @@ function renderTodayPage() {
 
     <div class="section-label">今日のタスク</div>
     <div id="today-task-list">${taskListHtml}</div>
+    ${extraButtonHtml}
   `;
 }
 
@@ -918,7 +1004,7 @@ function refreshSky({ snap = false } = {}) {
       weekdayStats: Store.deriveWeekdayStats(state),
       alreadyDoneLoad: computeDoneLoadToday(today),
       todayPendingLoad: pendingLoad,
-      todayCapacity: plan.fullCapacity,
+      todayCapacity: plan.totalCapacity,
     });
     const now = new Date();
     const r = Forecast.updateRelief(skyMemory, f.pressure, now.getTime());
@@ -1054,7 +1140,7 @@ window.Temper = {
   openDetailSheet, closeDetailSheet, setTaskFilter, setTaskSort, setTodayType,
   openAddTask, openEditTask, deleteTask, saveTaskFromModal, closeTaskModal,
   onLoadSliderInput, stepLoad, clearDateField, setTaskType, toggleModalWeekDay,
-  onCapacityInput, stepCapacity,
+  onCapacityInput, stepCapacity, generateExtra,
   pickImportFile, exportBackup,
 };
 
