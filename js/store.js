@@ -160,7 +160,7 @@ export function normalizeState(state) {
  * 1タスク分の形を揃える。type='weekly'（§4「繰り返し」）のときだけ
  * weekDays/doneDates が意味を持つ。'once' のときは従来通り done/doneDate。
  */
-function normalizeTask(t) {
+export function normalizeTask(t) {
   const type = t.type === 'weekly' ? 'weekly' : 'once';
   return {
     id: String(t.id || newId()),
@@ -927,4 +927,41 @@ export function deriveLearning(state) {
 
 function localDateStr(d) {
   return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+/* ------------------------------------------------------------
+   v1.11.0: 複数端末の同期用（sync-core.js が使う）
+   ------------------------------------------------------------ */
+/** historyの1件が曜日別・曜日×認知タイプの統計に与える影響を sign(+1/-1) 倍で加える */
+function addHistoryEntryToStats(state, h, sign) {
+  if (!h || (h.event !== 'completed' && h.event !== 'missed') || typeof h.date !== 'string') return;
+  const key = h.event === 'completed' ? 'completed' : 'missed';
+  const weekday = new Date(h.date + 'T00:00:00').getDay();
+  const wd = state.stats.weekday[weekday] || (state.stats.weekday[weekday] = { completed: 0, missed: 0 });
+  wd[key] = Math.max(0, (wd[key] || 0) + sign);
+  if (h.pattern) {
+    const k = `${weekday}:${h.pattern}`;
+    const wp = state.stats.weekdayPattern[k] || (state.stats.weekdayPattern[k] = { completed: 0, missed: 0 });
+    wp[key] = Math.max(0, (wp[key] || 0) + sign);
+  }
+}
+
+/**
+ * ある日のhistoryを、他の端末から届いた内容で置き換える。統計は「差分だけ」調整する
+ * （この端末にしか無い過去の統計や、取り込んだ統計を壊さない）。
+ */
+export function replaceHistoryDay(state, date, entries) {
+  const old = state.history.filter((h) => h && h.date === date);
+  state.history = state.history.filter((h) => !h || h.date !== date);
+  old.forEach((h) => addHistoryEntryToStats(state, h, -1));
+  (Array.isArray(entries) ? entries : []).forEach((h) => {
+    if (!h || typeof h !== 'object' || h.date !== date) return;
+    state.history.push(h);
+    addHistoryEntryToStats(state, h, +1);
+  });
+}
+
+/** 他端末から届いた設定を、保存データと同じ規則で整える */
+export function normalizeSettings(settings) {
+  return normalizeState({ tasks: [], history: [], settings: settings && typeof settings === 'object' ? settings : {}, stats: {} }).settings;
 }

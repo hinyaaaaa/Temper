@@ -1,6 +1,6 @@
 # Temper — 引き継ぎ書
 
-更新日: 2026-10-14（v1.10.0 予定タブ・学習エンジン・Service Worker修正。最新の変更は §14、§13=v1.9.0、空の詳細は §12）
+更新日: 2026-10-14（v1.11.0 複数端末の同期。最新の変更は §15、§14=v1.10.0、§13=v1.9.0、空の詳細は §12）
 対象リポジトリ: `hinyaaaaa/Temper`
 構成: `index.html` / `manifest.webmanifest` / `js/{app,planner,store,weather,forecast,skyrender,skyshader}.js` / `icons/*.png`
 
@@ -571,3 +571,36 @@ WebGL2の対応状況（iOS 15未満は退避表示になる）。重い場合�
 - `history` はすでに `historyKey` で冪等に結合できる。`stats` は履歴から再構築できる形にしておくのが安全（加算値のまま同期すると二重計上する）。
 - 今日の固定(pin)と空の補助値は端末ごとのままでよい（共有しない）。
 - 候補の無料枠（2026年10月の調査、二次情報のため導入前に公式ページで要確認）: Firebase Spark は Firestore 読み取り5万/日・書き込み2万/日・保存1GiB、カード不要（Cloud Storageは2026年2月以降Blaze必須）。Supabase Free はRealtime同時接続200・月200万メッセージ・DB 500MB、ただし1週間アクセスが無いとプロジェクトが一時停止する。
+
+
+---
+
+## 15. v1.11.0（2026-10-14）複数端末の同期（Firebase・無料枠）
+
+方針はFirebase（Auth + Firestore、Sparkプラン）に決定（ユーザー判断）。設定手順は `SYNC_SETUP.md`、Firestoreのルールは `firestore.rules`。
+
+### 15.1 構成
+| ファイル | 役割 |
+|---|---|
+| `js/sync-core.js` | 同期の中核（純粋ロジック。通信を知らない）。`createSyncEngine`。偽バックエンドでテスト可能 |
+| `js/sync-firebase.js` | Firebase SDK（gstatic の ES モジュール 11.0.2）を**設定されたときだけ**動的importする薄い層。永続キャッシュ（オフライン書き込みを溜める） |
+| `js/app.js` | 設定カード（構成の貼り付け・メール/パスワードでログイン/新規登録/ログアウト・同期をやめる）、`persist()`から送信を依頼、他端末の内容を取り込んだら保存→今日のおすすめ再計算→再描画→空更新 |
+| `js/store.js` | `replaceHistoryDay`（1日分の履歴を置き換え、統計は差分で調整）、`normalizeSettings`、`normalizeTask`をexport |
+
+### 15.2 モデル
+- 全て「更新が新しい方が勝つ」（LWW。端末の時計に依存。同時刻はハッシュの大きい方で全端末が同じ結果に収束）。
+- `users/{uid}/tasks/{id}`（削除は墓標 `deletedAt`）、`users/{uid}/days/{date}`（直近120日の履歴を1日1文書）、`users/{uid}/meta/settings`。値は `json` 文字列＋`updatedAt`。
+- 変更の検出は、各操作に手を入れず、保存のたびに「前回送った内容のハッシュ」と比べる（`localStorage['temper-sync-meta-<uid>']`）。取り込んだ内容はハッシュも更新するので、送り返さない（エコー抑止）。
+- 未送信の手元の変更がある文書には、届いた内容を上書きしない。
+- 同期しない: 今日の固定(pin)・空の補助値・`stats.follow`・`lastMissCheckDate`（端末ごとの派生値。共有すると二重に数える）。
+- 統計: 履歴の取り込み・取り消しは差分で `stats.weekday` / `stats.weekdayPattern` を調整（取り込み済みの統計や、この端末にしか無い過去の統計を壊さない）。
+
+### 15.3 安全策
+- 同期は、バックアップからの復元（`restoreFromBackupIfLost`）が終わってから開始。
+- 手元のタスクが空で、同期済みのタスクが3件以上あるときは、「全部削除された」とは送らない（復元・読み込み失敗からクラウドを守る）。副作用: 本当に全部を短時間で消すとクラウドには残る（コンソールで削除）。
+- Firebase読み込み失敗・通信失敗・壊れた文書は、状態表示に出すだけでアプリは動く。設定が無ければ何も読み込まない。
+
+### 15.4 検証
+- `node simulate.mjs`: 350,301件、全件通過（Part L: 2端末＋偽クラウド。追加・完了・削除の伝播、エコー抑止、オフライン中の同時編集の収束、未送信の手元の変更を保護、設定、履歴と統計の差分、取り消しの伝播、全削除の安全弁、壊れた文書、ハッシュのキー順非依存）。
+- headless Chrome: 構成の貼り付け（コンソールの `const firebaseConfig = {...}` をそのまま）→保存→SDK読み込み失敗時もアプリが動く。
+- **未検証（要・実機/実プロジェクト）**: 実際のFirebaseプロジェクトでの認証・Firestoreの読み書き・2台間のリアルタイム反映。サンドボックスからFirebaseへ通信できないため。`sync-firebase.js` はSDK 11.0.2 のモジュラーAPIに合わせて書いたが、実機で初回に確認すること。うまく動かないとき、設定画面の「同期」にエラーコードが出る（`permission-denied`=ルール未設定、`auth/...`=認証）。

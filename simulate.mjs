@@ -13,6 +13,7 @@ import * as Planner from './js/planner.js';
 import * as Store from './js/store.js';
 import * as Forecast from './js/forecast.js';
 import * as Schedule from './js/schedule.js';
+import * as SyncCore from './js/sync-core.js';
 
 // ---------------- 決定的な疑似乱数（再現性のため） ----------------
 function mulberry32(seed) {
@@ -1190,6 +1191,129 @@ function testV1100() {
 
 console.log('=== PART K: v1.10.0（学習傾向エンジン・予定の投影） ===');
 testV1100();
+
+
+// ============================================================
+// PART L — v1.11.0: 複数端末の同期（偽バックエンドで2端末を動かす）
+// ============================================================
+function testSync() {
+  // 共有クラウド（文書ストア）。pushされた文書を、自分以外の端末へ届ける。
+  const cloud = { docs: new Map(), devices: [], pushes: 0 };
+  const key = (d) => d.kind + ':' + d.id;
+  function makeDevice(name, state0) {
+    const dev = { name, state: state0, applied: 0, store: null, statusLog: [] };
+    let handlers = null;
+    dev.online = true; dev.queue = [];
+    dev.backend = {
+      start(h) {
+        handlers = h;
+        // 初回は、クラウドにある全文書を渡す（空でも必ず呼ぶ）
+        h.onDocs([...cloud.docs.values()]);
+      },
+      push(items) {
+        cloud.pushes += items.length;
+        if (!dev.online) { dev.queue.push(...items); return; }
+        deliver(items);
+      },
+    };
+    const deliver = (items) => {
+      items.forEach((it) => cloud.docs.set(key(it), it));
+      cloud.devices.forEach((o) => { if (o !== dev && o.online) o.handlers.onDocs(items); });
+    };
+    dev.reconnect = () => { dev.online = true; const q = dev.queue; dev.queue = []; if (q.length) deliver(q); handlers.onDocs([...cloud.docs.values()]); };
+    dev.engine = SyncCore.createSyncEngine({
+      getState: () => dev.state,
+      backend: dev.backend,
+      metaStore: { get: () => dev.store, set: (m) => { dev.store = JSON.parse(JSON.stringify(m)); } },
+      normalizeTask: Store.normalizeTask,
+      normalizeSettings: Store.normalizeSettings,
+      replaceHistoryDay: Store.replaceHistoryDay,
+      onRemoteApplied: () => { dev.applied++; },
+      now: () => dev.clock,
+    });
+    dev.clock = 1000;
+    Object.defineProperty(dev, 'handlers', { get: () => handlers });
+    cloud.devices.push(dev);
+    return dev;
+  }
+  const fresh = () => Store.normalizeState({ tasks: [], history: [], settings: {}, stats: {} });
+  const mk = (id, title, load = 3, o = {}) => ({ id, title, description: '', type: 'once', load, deadline: null, unlockDate: null, weekDays: [], doneDates: [], done: false, doneDate: null, pattern: null, createdAt: 1, ...o });
+  const sync = (...devs) => devs.forEach((d) => d.engine.flush());
+  const ids = (d) => d.state.tasks.map((t) => t.id).sort();
+
+  const A = makeDevice('A', fresh()), B = makeDevice('B', fresh());
+  A.engine.start(); B.engine.start();
+
+  // 追加が相手に届く
+  A.clock = 2000; A.state.tasks.push(mk('t1', '英単語 暗記'), mk('t2', '古文 読解'));
+  sync(A);
+  assert(JSON.stringify(ids(B)) === '["t1","t2"]' && B.applied >= 1, '[v1110-sync] 追加が相手に届かない', { b: ids(B) });
+
+  // エコー抑止: 取り込んだだけでは送り返さない
+  const before = cloud.pushes; sync(B);
+  assert(cloud.pushes === before, '[v1110-sync] 取り込んだ内容を送り返した（エコー）', { before, after: cloud.pushes });
+
+  // 完了が相手に届く（B→A）
+  B.clock = 3000; { const t = B.state.tasks.find((x) => x.id === 't1'); t.done = true; t.doneDate = '2026-10-14'; }
+  sync(B);
+  assert(A.state.tasks.find((x) => x.id === 't1').done === true, '[v1110-sync] 完了が届かない', {});
+
+  // 削除は墓標で伝わる
+  A.clock = 4000; A.state.tasks = A.state.tasks.filter((t) => t.id !== 't2'); sync(A);
+  assert(JSON.stringify(ids(B)) === '["t1"]', '[v1110-sync] 削除が届かない', { b: ids(B) });
+
+  // 同時編集は新しい方が勝ち、両端末が同じ結果に収束する
+  A.clock = 5000; A.state.tasks[0].title = 'Aの編集'; 
+  B.clock = 5500; B.state.tasks[0].title = 'Bの編集';
+  B.online = false; sync(A); sync(B); // Bはオフラインで編集
+  B.reconnect();
+  A.engine.flush(); B.engine.flush();
+  assert(A.state.tasks[0].title === 'Bの編集' && B.state.tasks[0].title === 'Bの編集', '[v1110-sync] 同時編集が新しい方に収束しない', { a: A.state.tasks[0].title, b: B.state.tasks[0].title });
+
+  // 未送信の手元の変更は、届いた古い内容で上書きされない
+  const C = makeDevice('C', fresh()); C.engine.start(); // 既存のクラウド内容を取り込む
+  assert(ids(C).length === 1, '[v1110-sync] 新しい端末が初回に取り込めない', { c: ids(C) });
+  C.clock = 9000; C.state.tasks[0].load = 9; // まだ送っていない
+  C.handlers.onDocs([{ kind: 'task', id: C.state.tasks[0].id, json: JSON.stringify({ ...C.state.tasks[0], load: 1 }), updatedAt: 8000, deletedAt: null }]);
+  assert(C.state.tasks[0].load === 9, '[v1110-sync] 未送信の手元の変更が古い内容で上書きされた', { load: C.state.tasks[0].load });
+  C.engine.flush();
+  assert(A.state.tasks[0].load === 9, '[v1110-sync] 手元の変更が他端末へ届かない', {});
+
+  // 設定の同期
+  A.clock = 10000; A.state.settings.capacityWeekday = 14; sync(A);
+  assert(B.state.settings.capacityWeekday === 14, '[v1110-sync] 設定が届かない', {});
+
+  // 履歴（1日単位）と統計の差分調整
+  const day = new Date(); const ds = (n) => { const d = new Date(day); d.setDate(d.getDate() - n); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
+  A.clock = 11000;
+  Store.recordCompletion(A.state, A.state.tasks[0], ds(1), () => 'memorization');
+  const wdA = new Date(ds(1) + 'T00:00:00').getDay();
+  sync(A);
+  assert(B.state.history.some((h) => h.date === ds(1)) && B.state.stats.weekday[wdA].completed === 1, '[v1110-sync] 履歴・統計が届かない', { w: B.state.stats.weekday[wdA] });
+  assert(B.state.stats.weekdayPattern[`${wdA}:memorization`].completed === 1, '[v1110-sync] 曜日×認知タイプの統計が届かない', {});
+  // 取り消しも伝わり、統計が戻る
+  A.clock = 12000; Store.undoCompletion(A.state, A.state.tasks[0], ds(1)); sync(A);
+  assert(!B.state.history.some((h) => h.date === ds(1)) && B.state.stats.weekday[wdA].completed === 0, '[v1110-sync] 取り消しが統計ごと伝わらない', { w: B.state.stats.weekday[wdA] });
+
+  // 安全弁: 手元が空（復元失敗など）でも、クラウドの内容を全削除しない
+  const D = makeDevice('D', fresh()); D.engine.start();
+  for (let i = 0; i < 3; i++) { D.clock = 13000 + i; D.state.tasks.push(mk('d' + i, '教材' + i)); }
+  sync(D);
+  const n = cloud.docs.size;
+  D.state.tasks = []; D.clock = 14000; sync(D);
+  const tomb = [...cloud.docs.values()].filter((d) => d.kind === 'task' && d.id.startsWith('d') && d.deletedAt).length;
+  assert(tomb === 0 && cloud.docs.size === n, '[v1110-sync] 手元が空のとき全削除を送ってしまった', { tomb });
+
+  // 壊れた文書は無視して止まらない
+  assert(A.engine.applyRemote({ kind: 'task', id: 'bad', json: '{oops', updatedAt: 99999, deletedAt: null }) === false, '[v1110-sync] 壊れた文書で例外/変更', {});
+  assert(A.engine.applyRemote(null) === false && A.engine.applyRemote({ kind: 'zzz', id: 'x' }) === false, '[v1110-sync] 不正な文書の扱い', {});
+
+  // ハッシュはキー順に依存しない
+  assert(SyncCore.hashOf({ a: 1, b: [1, 2], c: { x: 1, y: 2 } }) === SyncCore.hashOf({ c: { y: 2, x: 1 }, b: [1, 2], a: 1 }), '[v1110-sync] ハッシュがキー順に依存する', {});
+}
+
+console.log('=== PART L: v1.11.0（複数端末の同期） ===');
+testSync();
 
 console.log('\n=== 結果 ===');
 console.log(`総アサーション数: ${assertionCount}`);

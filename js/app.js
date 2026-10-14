@@ -12,6 +12,7 @@ import * as Planner from './planner.js';
 import * as Weather from './weather.js';
 import * as Forecast from './forecast.js';
 import * as Schedule from './schedule.js';
+import { createSyncEngine, historyCutoff } from './sync-core.js';
 import { createSky } from './skyrender.js';
 
 /* ------------------------------------------------------------
@@ -26,7 +27,7 @@ let pendingImport = null;  // インポート確認中のデータ
 let upcomingDay = 1;       // 予定タブで選んでいる日（1=明日 … 7=7日後）
 
 /** 設定タブに小さく表示するだけの表示用バージョン。改修のたびに上げる。 */
-const APP_VERSION = 'v1.10.0';
+const APP_VERSION = 'v1.11.0';
 
 const todayStr = () => {
   const d = new Date();
@@ -44,6 +45,7 @@ function persist() {
   // 日次の世代バックアップ（IndexedDB）。30分に1回までしか実際には動かず、
   // 失敗しても主機能には影響しない（憲法11条）。
   Store.maybeSnapshot(state).catch(() => {});
+  if (syncEngine) syncEngine.notifyLocalChange(); // 他の端末へ（変更があった分だけ、少し遅らせてまとめて送る）
 }
 
 /**
@@ -916,6 +918,8 @@ function renderSettingsPage() {
       </div>
     </div>
 
+    ${renderSyncCard()}
+
     <div class="settings-version">Temper ${APP_VERSION}</div>
   `;
 }
@@ -1153,6 +1157,159 @@ function applySkyChrome({ zenith, edge, lum }) {
   applySkyChrome._done = true;
 }
 
+
+/* ------------------------------------------------------------
+   複数端末の同期（v1.11.0）— Firebase（無料枠）
+   ------------------------------------------------------------
+   ロジックは sync-core.js、Firebaseとの通信は sync-firebase.js。ここは設定の保存・
+   サインイン・画面表示・「他端末の内容を取り込んだら再描画」を繋ぐだけ。
+   設定（Firebaseの構成）を入れていなければ何もしない。通信に失敗してもアプリは動く。
+   ------------------------------------------------------------ */
+const SYNC_CONFIG_KEY = 'temper-firebase-config';
+const SYNC_EMAIL_KEY = 'temper-sync-email';
+let syncEngine = null;
+let syncFb = null;
+let syncStatus = 'off'; // off | signedout | connecting | synced | offline | error:*
+let syncUser = null;
+
+function loadSyncConfig() {
+  try {
+    const c = JSON.parse(localStorage.getItem(SYNC_CONFIG_KEY) || 'null');
+    return c && c.apiKey && c.projectId && c.appId ? c : null;
+  } catch (e) { return null; }
+}
+
+/** コンソールに表示される `const firebaseConfig = { ... };` をそのまま貼れるようにする */
+function parseFirebaseConfig(text) {
+  const a = String(text || '').indexOf('{'), b = String(text || '').lastIndexOf('}');
+  if (a < 0 || b <= a) return null;
+  const body = text.slice(a, b + 1)
+    .replace(/\/\/.*$/gm, '')
+    .replace(/'/g, '"')
+    .replace(/([{,]\s*)([A-Za-z_][\w]*)\s*:/g, '$1"$2":')
+    .replace(/,\s*}/g, '}');
+  try {
+    const c = JSON.parse(body);
+    return c && c.apiKey && c.projectId && c.appId ? c : null;
+  } catch (e) { return null; }
+}
+
+function setSyncStatus(s) {
+  syncStatus = s;
+  const el = document.getElementById('sync-status');
+  if (el) el.textContent = syncStatusLabel();
+}
+function syncStatusLabel() {
+  if (syncStatus === 'off') return '未設定';
+  if (syncStatus === 'signedout') return 'サインインしていません';
+  if (syncStatus === 'connecting') return '接続中…';
+  if (syncStatus === 'synced') return `同期中${syncUser && syncUser.email ? '（' + syncUser.email + '）' : ''}`;
+  if (syncStatus === 'offline') return 'オフライン（戻ったら自動で同期します）';
+  if (syncStatus === 'error:load') return 'Firebaseを読み込めませんでした（通信を確認してください）';
+  if (syncStatus === 'error:permission-denied') return 'エラー：権限がありません（Firestoreのルールを確認）';
+  return 'エラー：' + syncStatus.replace(/^error:/, '');
+}
+
+async function initSync() {
+  const cfg = loadSyncConfig();
+  if (!cfg) { setSyncStatus('off'); return; }
+  setSyncStatus('connecting');
+  try {
+    const { loadFirebase } = await import('./sync-firebase.js');
+    syncFb = await loadFirebase(cfg);
+    syncFb.onAuthChanged((user) => {
+      stopSyncEngine();
+      syncUser = user || null;
+      if (currentPage === 'settings') render(); // サインイン/アウトに合わせてカードを切り替える
+      if (!user) { setSyncStatus('signedout'); return; }
+      setSyncStatus('connecting');
+      syncEngine = createSyncEngine({
+        getState: () => state,
+        backend: syncFb.makeBackend(user.uid, () => historyCutoff()),
+        metaStore: {
+          get: () => { try { return JSON.parse(localStorage.getItem('temper-sync-meta-' + user.uid) || 'null'); } catch (e) { return null; } },
+          set: (m) => localStorage.setItem('temper-sync-meta-' + user.uid, JSON.stringify(m)),
+        },
+        normalizeTask: Store.normalizeTask,
+        normalizeSettings: Store.normalizeSettings,
+        replaceHistoryDay: Store.replaceHistoryDay,
+        onStatus: (s) => setSyncStatus(navigator.onLine === false ? 'offline' : s),
+        onRemoteApplied: () => {
+          // 他の端末の内容を取り込んだ: 保存し（送り返さない）、今日のおすすめ・画面・空を最新にする
+          Store.saveState(state);
+          recomputeTodayPlan();
+          render();
+          refreshSky();
+        },
+      });
+      syncEngine.start();
+    });
+    window.addEventListener('offline', () => { if (syncEngine) setSyncStatus('offline'); });
+    window.addEventListener('online', () => { if (syncEngine) { setSyncStatus('synced'); syncEngine.flush(); } });
+  } catch (e) {
+    console.error('[Temper] sync init failed', e);
+    setSyncStatus('error:load');
+  }
+}
+function stopSyncEngine() {
+  if (syncEngine) { try { syncEngine.stop(); } catch (e) { /* 止められなくても続ける */ } syncEngine = null; }
+}
+
+function saveSyncConfig() {
+  const cfg = parseFirebaseConfig(document.getElementById('sync-config').value);
+  if (!cfg) { showToast('Firebaseの構成（apiKey・projectId・appIdを含む）を貼り付けてください'); return; }
+  try { localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(cfg)); } catch (e) { showToast('保存できませんでした'); return; }
+  location.reload(); // 読み込み直して初期化する
+}
+async function syncAuth(kind) {
+  if (!syncFb) return;
+  const email = document.getElementById('sync-email').value.trim();
+  const pw = document.getElementById('sync-pw').value;
+  if (!email || pw.length < 6) { showToast('メールアドレスと6文字以上のパスワードを入れてください'); return; }
+  try {
+    localStorage.setItem(SYNC_EMAIL_KEY, email);
+    if (kind === 'up') await syncFb.signUp(email, pw); else await syncFb.signIn(email, pw);
+    render();
+  } catch (e) {
+    const code = e && e.code ? e.code : '';
+    showToast(code.includes('invalid') || code.includes('wrong') ? 'メールアドレスかパスワードが違います'
+      : code.includes('email-already') ? 'このメールアドレスは登録済みです。ログインしてください'
+      : code.includes('weak') ? 'パスワードが短すぎます' : 'サインインできませんでした（' + (code || '通信エラー') + '）');
+  }
+}
+async function syncSignOut() { if (syncFb) { try { await syncFb.signOut(); } catch (e) { /* 失敗しても画面は戻す */ } } render(); }
+function clearSyncConfig() {
+  askConfirm({
+    title: '同期をやめますか', body: 'この端末の同期設定を消します。この端末のデータと、クラウド上のデータはそのまま残ります。',
+    okLabel: 'やめる', danger: true,
+    onOk: () => { stopSyncEngine(); try { localStorage.removeItem(SYNC_CONFIG_KEY); } catch (e) { /* 消せなくても再読込で判断される */ } location.reload(); },
+  });
+}
+
+function renderSyncCard() {
+  const cfg = loadSyncConfig();
+  const status = `<div class="sync-status-row"><span class="field-label">同期</span><span id="sync-status" class="sync-status">${esc(syncStatusLabel())}</span></div>`;
+  if (!cfg) {
+    return `<div class="card glass"><div class="settings-stack">${status}
+      <textarea id="sync-config" class="sync-input" rows="4" placeholder="Firebaseの構成（const firebaseConfig = {…}）を貼り付け"></textarea>
+      <button class="btn btn-primary btn-full" onclick="Temper.saveSyncConfig()">同期を設定する</button>
+    </div></div>`;
+  }
+  if (syncUser) {
+    return `<div class="card glass"><div class="settings-stack">${status}
+      <button class="btn btn-secondary btn-full" onclick="Temper.syncSignOut()">ログアウト</button>
+      <button class="btn btn-danger btn-full" onclick="Temper.clearSyncConfig()">同期をやめる</button>
+    </div></div>`;
+  }
+  const email = (() => { try { return localStorage.getItem(SYNC_EMAIL_KEY) || ''; } catch (e) { return ''; } })();
+  return `<div class="card glass"><div class="settings-stack">${status}
+    <input id="sync-email" class="sync-input" type="email" autocomplete="username" placeholder="メールアドレス" value="${esc(email)}">
+    <input id="sync-pw" class="sync-input" type="password" autocomplete="current-password" placeholder="パスワード（6文字以上）">
+    <div class="sheet-actions"><button class="btn btn-primary" onclick="Temper.syncAuth('in')">ログイン</button><button class="btn btn-secondary" onclick="Temper.syncAuth('up')">新規登録</button></div>
+    <button class="btn btn-danger btn-full" onclick="Temper.clearSyncConfig()">同期をやめる</button>
+  </div></div>`;
+}
+
 /* ------------------------------------------------------------
    FAB（タスク画面のみ）
    ------------------------------------------------------------
@@ -1212,7 +1369,8 @@ function init() {
     render();
     Store.requestPersistentStorage();
     registerOfflineSupport();
-    restoreFromBackupIfLost().catch(() => {});
+    // 同期は、バックアップからの復元が終わってから始める（空の状態を「全削除」として送らないため）
+    restoreFromBackupIfLost().catch(() => {}).then(() => initSync());
     // 時刻に伴う空の移ろい（日の出・夕焼けなど）と、日内のゆらぎのため、15秒ごとに更新する。
     setInterval(() => refreshSky(), 15 * 1000);
     // 長く閉じていた後に戻ってきたときは、古い空から動かさず今の空で始める。
@@ -1256,6 +1414,7 @@ window.Temper = {
   openAddTask, openEditTask, deleteTask, saveTaskFromModal, closeTaskModal,
   onLoadSliderInput, stepLoad, clearDateField, setTaskType, toggleModalWeekDay,
   onCapacityInput, stepCapacity, generateExtra, setUpcomingDay,
+  saveSyncConfig, syncSignOut, clearSyncConfig, syncAuth,
   pickImportFile, exportBackup,
 };
 
