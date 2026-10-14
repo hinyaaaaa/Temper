@@ -12,6 +12,7 @@
 import * as Planner from './js/planner.js';
 import * as Store from './js/store.js';
 import * as Forecast from './js/forecast.js';
+import * as Schedule from './js/schedule.js';
 
 // ---------------- 決定的な疑似乱数（再現性のため） ----------------
 function mulberry32(seed) {
@@ -1072,6 +1073,123 @@ function testV190() {
 
 console.log('=== PART J: v1.9.0（追加生成・偏り回避・週次必ず表示・天気の感度・明日期限） ===');
 testV190();
+
+
+// ============================================================
+// PART K — v1.10.0: 学習傾向エンジン・予定の投影
+// ============================================================
+function testV1100() {
+  const today = '2026-10-14'; // 水曜
+  const mk = (id, title, load, o = {}) => ({
+    id, title, description: '', type: 'once', load, deadline: null, unlockDate: null,
+    weekDays: [], doneDates: [], done: false, doneDate: null, pattern: null, ...o,
+  });
+  const patternOf = (t) => Planner.estimatePatternGeneral(t.title, t.description);
+
+  // 推定した認知タイプで曜日×認知タイプの実績が記録され、取り消しで元に戻る
+  {
+    const state = Store.normalizeState({ tasks: [], history: [], settings: {}, stats: {} });
+    const t = mk('a', '英単語 暗記', 3);
+    Store.recordCompletion(state, t, today, patternOf);
+    assert(state.stats.weekdayPattern['3:memorization'] && state.stats.weekdayPattern['3:memorization'].completed === 1, '[v1100-learn] 推定した認知タイプで実績が記録されない', { wp: state.stats.weekdayPattern });
+    assert(state.history[0].pattern === 'memorization', '[v1100-learn] historyに認知タイプが入らない', {});
+    Store.undoCompletion(state, t, today);
+    assert(state.stats.weekdayPattern['3:memorization'].completed === 0 && state.history.length === 0, '[v1100-learn] 取り消しで実績が戻らない', { wp: state.stats.weekdayPattern });
+  }
+
+  // 前日のおすすめのやり切り記録（二重に数えない）と派生
+  {
+    const state = Store.normalizeState({ tasks: [], history: [], settings: {}, stats: {} });
+    const y = '2026-10-13';
+    state.tasks.push(mk('p1', '英単語 暗記', 3, { done: true, doneDate: y }), mk('p2', '古文 読解', 8), mk('p3', '数学 標準問題', 3));
+    assert(Store.recordDayFollowThrough(state, y, ['p1', 'p2', 'p3', 'gone'], patternOf) === true, '[v1100-follow] 集計されない', {});
+    assert(Store.recordDayFollowThrough(state, y, ['p1', 'p2', 'p3'], patternOf) === false, '[v1100-follow] 同じ日を二重に数えた', {});
+    const L = Store.deriveLearning(state);
+    assert(L.overallFollow.n === 3 && Math.abs(L.overallFollow.ratio - 1 / 3) < 1e-9, '[v1100-follow] 全体のやり切り率が違う', { L });
+    assert(L.patternFollow.memorization.ratio === 1 && L.patternFollow.reading.ratio === 0, '[v1100-follow] 認知タイプ別が違う', { L });
+    assert(L.heavyFollow.n === 1 && L.heavyFollow.ratio === 0, '[v1100-follow] 重いタスクの記録が違う', { L });
+  }
+
+  // 曜日ごとの実際の負荷が容量に反映される（多く終える曜日は上がり、少ない曜日は下がる）
+  {
+    const state = Store.normalizeState({ tasks: [], history: [], settings: { capacityWeekday: 10 }, stats: {} });
+    for (let w = 1; w <= 4; w++) { // 過去4回の水曜に負荷14ずつ
+      const d = addDays(today, -7 * w);
+      state.history.push({ taskId: 'x' + w, event: 'completed', pattern: null, load: 14, date: d, ts: 1 });
+    }
+    const ws = Store.deriveWeekdayStats(state, today);
+    assert(ws[3] && ws[3].loadDays === 4 && Math.abs(ws[3].loadRatio - 1.4) < 1e-9, '[v1100-load] 曜日別の実負荷が違う', { ws3: ws[3] });
+    const up = Planner.computeEffectiveCapacity(10, { weekday: 3, weekdayStats: ws });
+    const base = Planner.computeEffectiveCapacity(10, { weekday: 3, weekdayStats: null });
+    assert(up > base && up <= Math.round(10 * 1.2), '[v1100-load] 多く終える曜日の容量が上がらない/上がりすぎ', { up, base });
+    const few = Store.normalizeState({ tasks: [], history: [], settings: { capacityWeekday: 10 }, stats: {} });
+    for (let w = 1; w <= 4; w++) few.history.push({ taskId: 'y' + w, event: 'completed', pattern: null, load: 4, date: addDays(today, -7 * w), ts: 1 });
+    const down = Planner.computeEffectiveCapacity(10, { weekday: 3, weekdayStats: Store.deriveWeekdayStats(few, today) });
+    assert(down < base && down >= Math.round(10 * 0.8), '[v1100-load] 少なく終える曜日の容量が下がらない/下がりすぎ', { down, base });
+    const two = Store.normalizeState({ tasks: [], history: [], settings: { capacityWeekday: 10 }, stats: {} });
+    for (let w = 1; w <= 2; w++) two.history.push({ taskId: 'z' + w, event: 'completed', pattern: null, load: 30, date: addDays(today, -7 * w), ts: 1 });
+    assert(Planner.computeEffectiveCapacity(10, { weekday: 3, weekdayStats: Store.deriveWeekdayStats(two, today) }) === base, '[v1100-load] 実績2日だけで容量が動いた', {});
+  }
+
+  // 学習した傾向が選定に効く: やり切れる認知タイプを少し優先／重いものをやり切れない人は1日1件
+  {
+    const tasks = [mk('m', '英単語 暗記', 3), mk('r', '古文 読解', 3)];
+    const learned = { patternFollow: { memorization: { ratio: 1, n: 20 }, reading: { ratio: 0.1, n: 20 } }, heavyFollow: null, overallFollow: null };
+    const p = Planner.buildTodayPlan({ tasks, todayStr: today, baseCapacity: 3, learned });
+    assert(p.entries.length === 1 && p.entries[0].id === 'm', '[v1100-learn] やり切れる認知タイプが優先されない', { ids: p.entries.map((e) => e.id) });
+    const few = Planner.buildTodayPlan({ tasks, todayStr: today, baseCapacity: 3, learned: { patternFollow: { memorization: { ratio: 1, n: 2 }, reading: { ratio: 0.1, n: 2 } } } });
+    assert(few.entries.length === 1, '[v1100-learn] 件数が足りない実績で動いた/壊れた', {});
+    const heavy = [mk('h1', '過去問 1年分', 8), mk('h2', '青チャート 発展', 8), mk('l1', '英単語 暗記', 2)];
+    const hp = Planner.buildTodayPlan({ tasks: heavy, todayStr: today, baseCapacity: 20, learned: { patternFollow: {}, heavyFollow: { ratio: 0.2, n: 10 }, overallFollow: null } });
+    assert(hp.entries.filter((e) => e.load >= 7).length <= 1, '[v1100-learn] 重いタスクが1日1件を超えた', { ids: hp.entries.map((e) => e.id) });
+    const np = Planner.buildTodayPlan({ tasks: heavy, todayStr: today, baseCapacity: 20 });
+    assert(np.entries.filter((e) => e.load >= 7).length === 2, '[v1100-learn] 実績が無いときまで重いタスクを絞った', {});
+  }
+
+  // 予定の投影: 元データを変えない／日数ぶん返す／週次は毎日出る／決定的／最新の状況に追従
+  {
+    const tasks = [
+      mk('w', '週次ふりかえり', 1, { type: 'weekly', weekDays: [0, 1, 2, 3, 4, 5, 6] }),
+      ...Array.from({ length: 12 }, (_, i) => mk('o' + i, '教材' + String.fromCharCode(65 + i), 3, i === 0 ? { deadline: addDays(today, 3) } : {})),
+    ];
+    const before = JSON.stringify(tasks);
+    const args = { tasks, todayStr: today, days: 7, todayPendingIds: ['o1', 'o2'], capacityForDate: () => 6 };
+    const a = Schedule.projectDays(args), b = Schedule.projectDays(args);
+    assert(JSON.stringify(tasks) === before, '[v1100-proj] 元のタスクを書き換えた', {});
+    assert(a.length === 7 && a[0].offset === 1 && a[6].date === addDays(today, 7), '[v1100-proj] 日数・日付が違う', { n: a.length });
+    assert(JSON.stringify(a.map((d) => d.plan.pinIds)) === JSON.stringify(b.map((d) => d.plan.pinIds)), '[v1100-proj] 同じ入力で結果が変わる', {});
+    a.forEach((d) => {
+      assert(d.plan.entries.some((e) => e.id === 'w'), '[v1100-proj] 週次が出ない日がある', { date: d.date });
+      assert(d.pressure >= 0 && d.pressure <= 1, '[v1100-proj] 見通しが範囲外', { p: d.pressure });
+    });
+    const seenAcross = new Set();
+    a.slice(0, 3).forEach((d) => d.plan.entries.filter((e) => e.id !== 'w').forEach((e) => { assert(!seenAcross.has(e.id), '[v1100-proj] 同じタスクが複数日に出た（終えた前提が効いていない）', { id: e.id }); seenAcross.add(e.id); }));
+    // 期限3日後のタスクは、その期限日までに出る
+    const day = a.findIndex((d) => d.plan.entries.some((e) => e.id === 'o0'));
+    assert(day >= 0 && day + 1 <= 3, '[v1100-proj] 期限のあるタスクが期限までに出ない', { day });
+    // 最新の状況: タスクを足すと次の投影に反映される
+    const added = Schedule.projectDays({ ...args, tasks: [...tasks, mk('n', '明後日提出', 4, { deadline: addDays(today, 2) })] });
+    assert(added.slice(0, 2).some((d) => d.plan.entries.some((e) => e.id === 'n')), '[v1100-proj] 追加したタスクが期限までの予定に出ない', {});
+    // 持ち越し: やり切り率が低いと、先送りされたタスクが翌日以降に残る
+    const few = [mk('c1', '教材A', 3), mk('c2', '教材B', 3), mk('c3', '教材C', 3)];
+    const low = Schedule.projectDays({ tasks: few, todayStr: today, days: 3, todayPendingIds: [], capacityForDate: () => 9, learned: { overallFollow: { ratio: 0.4, n: 20 }, patternFollow: {}, heavyFollow: null } });
+    const full = Schedule.projectDays({ tasks: few, todayStr: today, days: 3, todayPendingIds: [], capacityForDate: () => 9 });
+    const count = (r) => r.map((d) => d.plan.entries.length);
+    assert(count(full)[0] === 3 && count(full)[1] === 0, '[v1100-proj] 満額の前提で翌日に残る', { c: count(full) });
+    assert(count(low)[1] > 0, '[v1100-proj] やり切り率が低いのに持ち越されない', { c: count(low) });
+  }
+
+  // 壊れた/古いstateを正規化してもfollowが必ず揃う
+  {
+    const st = Store.normalizeState({ tasks: [], history: [], settings: {}, stats: { follow: { byPattern: 'x', overall: { planned: 'a' } } } });
+    assert(st.stats.follow.overall.planned === 0 && typeof st.stats.follow.byPattern === 'object', '[v1100-learn] 壊れたfollowが復元されない', { f: st.stats.follow });
+    const old = Store.normalizeState({ tasks: [], history: [], settings: {}, stats: { weekday: {}, weekdayPattern: {} } });
+    assert(old.stats.follow && old.stats.follow.lastDate === null, '[v1100-learn] 旧形式のstateにfollowが付かない', {});
+  }
+}
+
+console.log('=== PART K: v1.10.0（学習傾向エンジン・予定の投影） ===');
+testV1100();
 
 console.log('\n=== 結果 ===');
 console.log(`総アサーション数: ${assertionCount}`);

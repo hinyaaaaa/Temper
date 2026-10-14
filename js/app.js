@@ -11,6 +11,7 @@ import * as Store from './store.js';
 import * as Planner from './planner.js';
 import * as Weather from './weather.js';
 import * as Forecast from './forecast.js';
+import * as Schedule from './schedule.js';
 import { createSky } from './skyrender.js';
 
 /* ------------------------------------------------------------
@@ -22,14 +23,21 @@ let currentTodayPlan = null;
 let currentPlanDate = null; // currentTodayPlan がどの日付向けに作られたか
 let editingTaskId = null;
 let pendingImport = null;  // インポート確認中のデータ
+let upcomingDay = 1;       // 予定タブで選んでいる日（1=明日 … 7=7日後）
 
 /** 設定タブに小さく表示するだけの表示用バージョン。改修のたびに上げる。 */
-const APP_VERSION = 'v1.9.0';
+const APP_VERSION = 'v1.10.0';
 
 const todayStr = () => {
   const d = new Date();
   return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
 };
+
+/** 認知タイプの推定（保存されていないタスクはタイトルから。個人の履歴も参照する） */
+function makePatternOf() {
+  const ph = Store.derivePatternHistory(state);
+  return (t) => t.pattern || Planner.estimatePattern(t.title, t.description, ph);
+}
 
 function persist() {
   Store.saveState(state);
@@ -89,6 +97,9 @@ function loadPlanPin(today) {
       return planPin;
     }
   } catch (e) { /* 読めなければ作り直す */ }
+  // 新しい日の最初の呼び出し: 前日の選定をここで学習に数えてから作り直す
+  // （アプリを開き直した・日をまたいだ、どの入口からでも前日分を取りこぼさない）
+  if (Store.recordDayFollowThrough && settlePreviousDayQuiet(today)) persist();
   planPin = { date: today, ids: [], bonus: 0, cap: null };
   return planPin;
 }
@@ -119,6 +130,7 @@ function recomputeTodayPlan({ forceExtra = false } = {}) {
     capacityForDate: (dateStr) => Store.getCapacityFor(state, dateStr),
     patternHistory: Store.derivePatternHistory(state),
     alreadyDoneLoad: doneLoad,
+    learned: Store.deriveLearning(state),
     capacityBonus: pin.bonus,
     pinIds: pin.ids,
     pinCapacity: pin.cap,
@@ -161,6 +173,21 @@ function generateExtra() {
 }
 
 /**
+ * 前日までのおすすめのうち、その日のうちに終えたものを学習用に数える（Store.recordDayFollowThrough）。
+ * 前日の選定は端末内のpin（localStorage）に残っている。無ければ何もしない。
+ */
+function settlePreviousDay(today, patternOf) {
+  try {
+    const v = JSON.parse(localStorage.getItem(PLAN_PIN_KEY) || 'null');
+    if (v && typeof v.date === 'string' && v.date < today && Array.isArray(v.ids)) {
+      return Store.recordDayFollowThrough(state, v.date, v.ids, patternOf);
+    }
+  } catch (e) { /* 読めなければ数えないだけ */ }
+  return false;
+}
+function settlePreviousDayQuiet(today) { return settlePreviousDay(today, makePatternOf()); }
+
+/**
  * 日付が変わっていたら（アプリを閉じずに日をまたいだ場合など）
  * 今日のプランを作り直す。
  * ------------------------------------------------------------
@@ -181,7 +208,9 @@ function ensureTodayPlanFresh() {
     // 完了しなかった」週次タスクをmissedとして記録する（ALGORITHM_
     // IMPROVEMENT_PLAN §0）。recomputeTodayPlan()より前に行うことで、
     // 今回の再計算がこのmissedを反映した曜日×Pattern統計を使える。
-    Store.recordMissedOccurrencesUntilToday(state, today);
+    const patternOf = makePatternOf();
+    Store.recordMissedOccurrencesUntilToday(state, today, patternOf);
+    settlePreviousDay(today, patternOf);
     persist();
     recomputeTodayPlan();
   }
@@ -204,6 +233,7 @@ function render() {
   try {
     ensureTodayPlanFresh();
     if (currentPage === 'today') root.innerHTML = renderTodayPage();
+    else if (currentPage === 'upcoming') root.innerHTML = renderUpcomingPage();
     else if (currentPage === 'tasks') root.innerHTML = renderTasksPage();
     else if (currentPage === 'settings') root.innerHTML = renderSettingsPage();
     syncRangeFills(root);
@@ -335,6 +365,72 @@ function renderTodayPage() {
   `;
 }
 
+/* ------------------------------------------------------------
+   予定タブ（v1.10.0）— 明日〜7日後
+   ------------------------------------------------------------
+   投影そのものは schedule.js（純粋関数）が持つ。ここは「最新の状態」を渡して
+   結果を描くだけ。今日のおすすめと違い固定(pin)しないので、タスクの追加・完了・
+   容量の変更・学習の更新があれば、描くたびに並びごと最新の状況で計算し直す。
+   ------------------------------------------------------------ */
+function computeProjection() {
+  const today = todayStr();
+  if (!currentTodayPlan || currentPlanDate !== today) recomputeTodayPlan();
+  const pendingIds = currentTodayPlan.entries.filter((e) => !isTaskDoneToday(e.id, today)).map((e) => e.id);
+  return Schedule.projectDays({
+    tasks: state.tasks,
+    todayStr: today,
+    days: 7,
+    todayPendingIds: pendingIds,
+    capacityForDate: (dateStr) => Store.getCapacityFor(state, dateStr),
+    weekdayStats: Store.deriveWeekdayStats(state, today),
+    weekdayPatternStats: Store.deriveWeekdayPatternStats(state),
+    patternHistory: Store.derivePatternHistory(state),
+    learned: Store.deriveLearning(state),
+  });
+}
+
+function renderUpcomingPage() {
+  const proj = computeProjection();
+  const sel = proj.find((d) => d.offset === upcomingDay) || proj[0];
+  const wd = ['日', '月', '火', '水', '木', '金', '土'];
+  const chips = proj.map((d) => {
+    const dt = new Date(d.date + 'T00:00:00');
+    return `<button class="day-chip${d.offset === sel.offset ? ' active' : ''}" onclick="Temper.setUpcomingDay(${d.offset})" aria-label="${d.offset}日後 ${dt.getMonth() + 1}月${dt.getDate()}日">
+      <span class="dc-off">${d.offset === 1 ? '明日' : d.offset + '日後'}</span>
+      <span class="dc-d">${dt.getDate()}<small>${wd[dt.getDay()]}</small></span>
+      <span class="dc-load">${d.load}</span>
+    </button>`;
+  }).join('');
+
+  const entries = sel.plan.entries;
+  const listHtml = entries.length
+    ? entries.map((e) => renderTaskCard(e, { preview: true })).join('')
+    : `<div class="empty-state glass card"><div class="glyph">✧</div><div class="msg">この日に扱うタスクはありません</div></div>`;
+
+  return `
+    <div class="page-head">
+      <div class="today-date">${formatDateLabel(sel.date)}</div>
+    </div>
+    <div class="day-chips" role="tablist">${chips}</div>
+    <div class="card glass progress-card">
+      <div class="progress-main">
+        <div class="progress-text">
+          <div class="progress-value">この日の負荷　<b>${sel.load}</b> / ${sel.capacity}</div>
+          <div class="progress-sub">${entries.length}件の見込み</div>
+        </div>
+      </div>
+    </div>
+    <div class="section-label">この日のタスク</div>
+    <div id="upcoming-task-list">${listHtml}</div>
+  `;
+}
+
+function setUpcomingDay(n) {
+  upcomingDay = Math.max(1, Math.min(7, Number(n) || 1));
+  render();
+  refreshSky();
+}
+
 /**
  * 「終了目安」を、今日中の時刻ではなく、現在登録されている全タスクが
  * この先の容量ペースで消化されていくと計算上何日に終わるか、という
@@ -423,13 +519,18 @@ function renderTaskCard(entryOrTask, opts = {}) {
         </button>
       </div>` : '';
 
-  return `
-    <div class="task-card glass${doneToday ? ' done' : ''}" data-task-id="${t.id}"
+  // 予定タブ（opts.preview）は見るだけ。完了のチェックも長押しの詳細も持たない
+  const pressAttrs = opts.preview ? '' : `
          ontouchstart="Temper.onCardPressStart('${t.id}')" ontouchend="Temper.onCardPressEnd()" ontouchmove="Temper.onCardPressEnd()"
-         onmousedown="Temper.onCardPressStart('${t.id}')" onmouseup="Temper.onCardPressEnd()" onmouseleave="Temper.onCardPressEnd()">
-      <button class="task-check${doneToday ? ' checked' : ''}" onclick="event.stopPropagation();Temper.toggleTask('${t.id}')" aria-label="${doneToday ? '未完了に戻す' : '完了にする'}">
+         onmousedown="Temper.onCardPressStart('${t.id}')" onmouseup="Temper.onCardPressEnd()" onmouseleave="Temper.onCardPressEnd()"`;
+  const checkHtml = opts.preview
+    ? '<span class="task-check preview" aria-hidden="true"></span>'
+    : `<button class="task-check${doneToday ? ' checked' : ''}" onclick="event.stopPropagation();Temper.toggleTask('${t.id}')" aria-label="${doneToday ? '未完了に戻す' : '完了にする'}">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20,6 9,17 4,12"/></svg>
-      </button>
+      </button>`;
+  return `
+    <div class="task-card glass${doneToday ? ' done' : ''}" data-task-id="${t.id}"${pressAttrs}>
+      ${checkHtml}
       <div class="task-main">
         <div class="task-title">${esc(t.title)}</div>
         <div class="task-meta-row">${chips.join('')}</div>
@@ -542,7 +643,7 @@ function toggleTask(taskId) {
       t.done = true;
       t.doneDate = today;
     }
-    Store.recordCompletion(state, t, today);
+    Store.recordCompletion(state, t, today, makePatternOf());
     persist();
     render();
   };
@@ -993,6 +1094,17 @@ function refreshSky({ snap = false } = {}) {
   try {
     const today = todayStr();
     if (!currentTodayPlan || currentPlanDate !== today) recomputeTodayPlan();
+    // 予定タブでは、選んでいる日の見通しを映す（日ごとに空が変わる）。
+    // 「逼迫が解けた直後」の回復系は今日の話なので使わず、時刻は今の時刻のまま、日付だけその日にする。
+    if (currentPage === 'upcoming') {
+      const proj = computeProjection();
+      const day = proj.find((d) => d.offset === upcomingDay) || proj[0];
+      const now = new Date();
+      const when = new Date(day.date + 'T00:00:00');
+      when.setHours(now.getHours(), now.getMinutes(), now.getSeconds());
+      sky.setTarget(Weather.resolveSky({ pressure: day.pressure, relief: 0, date: when, drift: Weather.skyDrift(when) }), { snap });
+      return;
+    }
     const plan = currentTodayPlan;
     const pendingLoad = plan.entries
       .filter((e) => !isTaskDoneToday(e.id, today))
@@ -1107,6 +1219,7 @@ function init() {
     let hiddenAt = 0;
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) { hiddenAt = Date.now(); return; }
+      if (currentPage === 'upcoming') render(); // 戻ってきたら最新の状況で並べ直す
       refreshSky({ snap: hiddenAt && Date.now() - hiddenAt > 10 * 60 * 1000 });
     });
     // 何も操作しないままアプリを開きっぱなしで日付をまたいだ場合でも
@@ -1117,9 +1230,11 @@ function init() {
     setInterval(() => {
       const today = todayStr();
       if (currentPlanDate !== today) {
-        recomputeTodayPlan();
+        ensureTodayPlanFresh();
         if (currentPage === 'today') render();
       }
+      // 予定タブは、時間が進んだ分（日付・曜日・解禁日など）も含めて最新の状況で並べ直す
+      if (currentPage === 'upcoming') render();
     }, 60 * 1000);
 
     document.querySelectorAll('.overlay').forEach((overlay) => {
@@ -1140,7 +1255,7 @@ window.Temper = {
   openDetailSheet, closeDetailSheet, setTaskFilter, setTaskSort, setTodayType,
   openAddTask, openEditTask, deleteTask, saveTaskFromModal, closeTaskModal,
   onLoadSliderInput, stepLoad, clearDateField, setTaskType, toggleModalWeekDay,
-  onCapacityInput, stepCapacity, generateExtra,
+  onCapacityInput, stepCapacity, generateExtra, setUpcomingDay,
   pickImportFile, exportBackup,
 };
 

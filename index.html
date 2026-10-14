@@ -226,7 +226,7 @@ body {
 .nav-item {
   display: flex; flex-direction: row; align-items: center; gap: 7px;
   white-space: nowrap;
-  height: calc(var(--nav-h) - 8px); padding: 0 16px;
+  height: calc(var(--nav-h) - 8px); padding: 0 12px;
   border: none; background: none; cursor: pointer;
   color: var(--ink-faint); border-radius: var(--r-pill);
   transition: color .25s ease, background .25s ease;
@@ -254,6 +254,18 @@ body {
 .progress-value { font-size: var(--fs-meta); color: var(--ink-soft); }
 .progress-value b { font-family: var(--font-display); font-size: 24px; font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
 .progress-sub { font-size: 12px; color: var(--ink-faint); margin-top: 2px; }
+.day-chips { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin: 0 0 var(--sp-4); }
+.day-chip {
+  display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 8px 0 7px;
+  border-radius: 14px; border: 1px solid var(--glass-line); background: var(--glass-fill);
+  color: var(--ink-soft, var(--ink)); font: inherit; cursor: pointer; min-width: 0;
+}
+.day-chip.active { background: var(--glass-fill-strong); color: var(--ink); border-color: var(--ink-faint); }
+.day-chip .dc-off { font-size: 10px; letter-spacing: .02em; opacity: .75; }
+.day-chip .dc-d { font-size: 17px; font-weight: 500; line-height: 1.1; }
+.day-chip .dc-d small { font-size: 10px; margin-left: 1px; opacity: .75; }
+.day-chip .dc-load { font-size: 11px; opacity: .7; }
+.task-check.preview { cursor: default; opacity: .55; pointer-events: none; }
 .extra-btn { margin-top: 12px; }
 .progress-finish { font-size: var(--fs-label); color: var(--ink-faint); opacity: .8; margin-top: 3px; }
 
@@ -520,6 +532,9 @@ body:has(.overlay.open) #toast.show { transform: translateX(-50%) translateY(0);
   <nav id="nav-bar" class="glass">
     <button class="nav-item active" data-page="today" onclick="Temper.navigateTo('today')">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.2"/><line x1="12" y1="2.5" x2="12" y2="4.5"/><line x1="12" y1="19.5" x2="12" y2="21.5"/><line x1="4.2" y1="4.2" x2="5.6" y2="5.6"/><line x1="18.4" y1="18.4" x2="19.8" y2="19.8"/><line x1="2.5" y1="12" x2="4.5" y2="12"/><line x1="19.5" y1="12" x2="21.5" y2="12"/><line x1="4.2" y1="19.8" x2="5.6" y2="18.4"/><line x1="18.4" y1="5.6" x2="19.8" y2="4.2"/></svg><span>今日</span>
+    </button>
+    <button class="nav-item" data-page="upcoming" onclick="Temper.navigateTo('upcoming')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="15" rx="2.5"/><line x1="3.5" y1="10" x2="20.5" y2="10"/><line x1="8" y1="3" x2="8" y2="7"/><line x1="16" y1="3" x2="16" y2="7"/></svg><span>予定</span>
     </button>
     <button class="nav-item" data-page="tasks" onclick="Temper.navigateTo('tasks')">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6h12"/><path d="M9 12h12"/><path d="M9 18h12"/><path d="M3.5 6h.01"/><path d="M3.5 12h.01"/><path d="M3.5 18h.01"/></svg><span>タスク</span>

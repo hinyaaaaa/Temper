@@ -53,6 +53,9 @@ const STATE_DEFAULTS = {
     // "missed" として計上してしまうのを避けるため。ALGORITHM_IMPROVEMENT_PLAN
     // §0 参照）。
     lastMissCheckDate: null,
+    // v1.10.0: 「おすすめに出たものを、その日のうちに終えたか」の実績。
+    // 認知タイプ別・負荷帯別・全体の { planned, done } と、最後に集計した日付。
+    follow: { byPattern: {}, byLoad: {}, overall: { planned: 0, done: 0 }, lastDate: null },
   },
 };
 
@@ -140,6 +143,13 @@ export function normalizeState(state) {
   if (!state.stats.weekday) state.stats.weekday = {};
   if (!state.stats.weekdayPattern) state.stats.weekdayPattern = {};
   if (typeof state.stats.lastMissCheckDate !== 'string') state.stats.lastMissCheckDate = null;
+  const fo = state.stats.follow && typeof state.stats.follow === 'object' ? state.stats.follow : {};
+  state.stats.follow = {
+    byPattern: fo.byPattern && typeof fo.byPattern === 'object' ? fo.byPattern : {},
+    byLoad: fo.byLoad && typeof fo.byLoad === 'object' ? fo.byLoad : {},
+    overall: fo.overall && Number.isFinite(fo.overall.planned) && Number.isFinite(fo.overall.done) ? fo.overall : { planned: 0, done: 0 },
+    lastDate: typeof fo.lastDate === 'string' ? fo.lastDate : null,
+  };
 
   state.tasks = state.tasks.filter((t) => t && typeof t === 'object').map(normalizeTask);
 
@@ -499,21 +509,24 @@ export function isTaskComplete(task, todayStr) {
 /* ------------------------------------------------------------
    統計更新
    ------------------------------------------------------------ */
-export function recordCompletion(state, task, completedOn) {
+export function recordCompletion(state, task, completedOn, patternOf = null) {
+  // 認知タイプは保存されていないタスクが多い（実行時にタイトルから推定している）。
+  // 推定値を渡して、曜日×認知タイプの実績が空のままにならないようにする。
+  const pattern = task.pattern || (typeof patternOf === 'function' ? patternOf(task) : null) || null;
   const weekday = new Date(completedOn + 'T00:00:00').getDay();
   const wd = state.stats.weekday[weekday] || { completed: 0, missed: 0 };
   wd.completed += 1;
   state.stats.weekday[weekday] = wd;
 
-  if (task.pattern) {
-    const key = `${weekday}:${task.pattern}`;
+  if (pattern) {
+    const key = `${weekday}:${pattern}`;
     const wp = state.stats.weekdayPattern[key] || { completed: 0, missed: 0 };
     wp.completed += 1;
     state.stats.weekdayPattern[key] = wp;
   }
 
   state.history.push({
-    taskId: task.id, event: 'completed', pattern: task.pattern,
+    taskId: task.id, event: 'completed', pattern,
     load: task.load, deadline: task.deadline, date: completedOn, ts: Date.now(),
   });
 }
@@ -533,40 +546,44 @@ export function recordCompletion(state, task, completedOn) {
  * だが、念のため後ろから探して直近の1件のみ対象にする）。
  */
 export function undoCompletion(state, task, completedOn) {
+  let recordedPattern = null;
   for (let i = state.history.length - 1; i >= 0; i--) {
     const h = state.history[i];
     if (h.taskId === task.id && h.date === completedOn && h.event === 'completed') {
+      recordedPattern = h.pattern || null;
       state.history.splice(i, 1);
       break;
     }
   }
+  const pattern = recordedPattern || task.pattern || null;
 
   const weekday = new Date(completedOn + 'T00:00:00').getDay();
   const wd = state.stats.weekday[weekday];
   if (wd && wd.completed > 0) wd.completed -= 1;
 
-  if (task.pattern) {
-    const key = `${weekday}:${task.pattern}`;
+  if (pattern) {
+    const key = `${weekday}:${pattern}`;
     const wp = state.stats.weekdayPattern[key];
     if (wp && wp.completed > 0) wp.completed -= 1;
   }
 }
 
-export function recordMiss(state, task, dateStr) {
+export function recordMiss(state, task, dateStr, patternOf = null) {
+  const pattern = task.pattern || (typeof patternOf === 'function' ? patternOf(task) : null) || null;
   const weekday = new Date(dateStr + 'T00:00:00').getDay();
   const wd = state.stats.weekday[weekday] || { completed: 0, missed: 0 };
   wd.missed += 1;
   state.stats.weekday[weekday] = wd;
 
-  if (task.pattern) {
-    const key = `${weekday}:${task.pattern}`;
+  if (pattern) {
+    const key = `${weekday}:${pattern}`;
     const wp = state.stats.weekdayPattern[key] || { completed: 0, missed: 0 };
     wp.missed += 1;
     state.stats.weekdayPattern[key] = wp;
   }
 
   state.history.push({
-    taskId: task.id, event: 'missed', pattern: task.pattern,
+    taskId: task.id, event: 'missed', pattern,
     load: task.load, deadline: task.deadline, date: dateStr, ts: Date.now(),
   });
 }
@@ -601,7 +618,7 @@ function taskCreatedDateStr(task) {
  * 呼び出し側（app.js）は「日付が変わったことを検知したタイミング」で
  * 一度だけ呼べばよい（内部でlastMissCheckDateにより冪等性を保つ）。
  */
-export function recordMissedOccurrencesUntilToday(state, todayStr) {
+export function recordMissedOccurrencesUntilToday(state, todayStr, patternOf = null) {
   const last = state.stats.lastMissCheckDate;
   if (!last) {
     state.stats.lastMissCheckDate = todayStr;
@@ -617,7 +634,7 @@ export function recordMissedOccurrencesUntilToday(state, todayStr) {
         && d >= taskCreatedDateStr(t)
         && !(t.deadline && d > t.deadline)
         && !(Array.isArray(t.doneDates) && t.doneDates.includes(d)))
-      .forEach((t) => recordMiss(state, t, d));
+      .forEach((t) => recordMiss(state, t, d, patternOf));
   }
   state.stats.lastMissCheckDate = todayStr;
 }
@@ -625,11 +642,34 @@ export function recordMissedOccurrencesUntilToday(state, todayStr) {
 /* ------------------------------------------------------------
    Plannerへ渡す集計
    ------------------------------------------------------------ */
-export function deriveWeekdayStats(state) {
+export function deriveWeekdayStats(state, todayStr = null) {
   const out = {};
   Object.entries(state.stats.weekday).forEach(([wd, v]) => {
     const total = (v.completed || 0) + (v.missed || 0);
     if (total > 0) out[wd] = { completedRatio: v.completed / total, samples: total };
+  });
+
+  // v1.10.0: 曜日ごとの「実際に終えた負荷」（直近8週・今日を除く）を、設定の容量と比べる。
+  // 容量より多く終えている曜日は上げ、少ない曜日は下げる材料にする（computeEffectiveCapacity）。
+  // 完了が1件も無かった日は数えない（休み・アプリを開かなかった日を「できなかった日」にしない）。
+  const today = todayStr || localDateStr(new Date());
+  const from = addDaysStr(today, -56);
+  const perDay = {};
+  state.history.forEach((h) => {
+    if (!h || h.event !== 'completed' || typeof h.date !== 'string') return;
+    if (h.date >= today || h.date < from) return;
+    perDay[h.date] = (perDay[h.date] || 0) + (Number.isFinite(h.load) && h.load > 0 ? h.load : 1);
+  });
+  const byWd = {};
+  Object.entries(perDay).forEach(([d, load]) => {
+    const wd = new Date(d + 'T00:00:00').getDay();
+    (byWd[wd] || (byWd[wd] = [])).push(load);
+  });
+  Object.entries(byWd).forEach(([wd, loads]) => {
+    const cap = (state.settings.holidayWeekdays || []).includes(Number(wd)) ? state.settings.capacityHoliday : state.settings.capacityWeekday;
+    if (!(cap > 0)) return;
+    const avg = loads.reduce((a, b) => a + b, 0) / loads.length;
+    out[wd] = { completedRatio: 0.7, samples: 0, ...(out[wd] || {}), loadRatio: avg / cap, loadDays: loads.length };
   });
   return out;
 }
@@ -834,4 +874,57 @@ export async function loadLatestSnapshot() {
   } finally {
     try { db.close(); } catch (e) { /* 継続 */ }
   }
+}
+
+
+/* ------------------------------------------------------------
+   v1.10.0: おすすめの「やり切り」の実績（学習傾向）
+   ------------------------------------------------------------
+   前日までのおすすめ（その日に決めた選定）のうち、その日のうちに終えたものを
+   認知タイプ別・負荷帯別・全体で数える。Plannerはこれを、
+   「やり切れる傾向のあるものを多めに／やり切れないものは減らす」ための
+   小さな補正に使う（評価語は使わない。憲法7条）。
+   ------------------------------------------------------------ */
+export function loadBandOf(load) {
+  const n = Number(load);
+  return n >= 7 ? 'heavy' : n >= 4 ? 'mid' : 'light';
+}
+
+/**
+ * @param {string} dateStr 集計する日（おすすめを出した日）
+ * @param {string[]} plannedIds その日のおすすめのタスクID
+ * @param {(t:object)=>string} [patternOf] 認知タイプの推定
+ * @returns {boolean} 集計した（同じ日を二重に数えない）
+ */
+export function recordDayFollowThrough(state, dateStr, plannedIds, patternOf = null) {
+  const f = state.stats.follow;
+  if (!f || (f.lastDate && f.lastDate >= dateStr)) return false;
+  const byId = new Map(state.tasks.map((t) => [t.id, t]));
+  (Array.isArray(plannedIds) ? plannedIds : []).forEach((id) => {
+    const t = byId.get(id);
+    if (!t) return; // 消されたタスクは数えない
+    const done = t.type === 'weekly'
+      ? Array.isArray(t.doneDates) && t.doneDates.includes(dateStr)
+      : !!t.done && t.doneDate === dateStr;
+    const p = t.pattern || (typeof patternOf === 'function' ? patternOf(t) : null) || 'unknown';
+    const band = loadBandOf(t.load);
+    [f.byPattern[p] || (f.byPattern[p] = { planned: 0, done: 0 }),
+      f.byLoad[band] || (f.byLoad[band] = { planned: 0, done: 0 }),
+      f.overall].forEach((b) => { b.planned += 1; if (done) b.done += 1; });
+  });
+  f.lastDate = dateStr;
+  return true;
+}
+
+/** @returns {{patternFollow:object, heavyFollow:{ratio:number,n:number}|null, overallFollow:{ratio:number,n:number}|null}} */
+export function deriveLearning(state) {
+  const f = state.stats.follow || { byPattern: {}, byLoad: {}, overall: { planned: 0, done: 0 } };
+  const r = (b) => (b && b.planned > 0 ? { ratio: b.done / b.planned, n: b.planned } : null);
+  const patternFollow = {};
+  Object.entries(f.byPattern).forEach(([p, b]) => { const v = r(b); if (v) patternFollow[p] = v; });
+  return { patternFollow, heavyFollow: r(f.byLoad.heavy), overallFollow: r(f.overall) };
+}
+
+function localDateStr(d) {
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
 }

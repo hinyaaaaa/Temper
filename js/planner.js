@@ -168,12 +168,18 @@ export function computeEffectiveCapacity(baseCapacity, context = {}) {
   const { weekday, weekdayStats } = context;
   let factor = 1.0;
 
-  if (weekday != null && weekdayStats && weekdayStats[weekday] && weekdayStats[weekday].samples >= 5) {
-    const { completedRatio } = weekdayStats[weekday];
+  const ws = weekday != null && weekdayStats ? weekdayStats[weekday] : null;
+  let delta = 0;
+  if (ws && ws.samples >= 5) {
     // 完了率が低い曜日は実効容量を下げ、高い曜日はわずかに上げる（急激な変化は避ける）
-    const delta = (completedRatio - 0.7) * 0.3; // 0.7を中立点とする緩やかな傾き
-    factor += Math.max(-CAPACITY_ADJUST_MAX_RATIO, Math.min(CAPACITY_ADJUST_MAX_RATIO, delta));
+    delta += Math.max(-CAPACITY_ADJUST_MAX_RATIO, Math.min(CAPACITY_ADJUST_MAX_RATIO, (ws.completedRatio - 0.7) * 0.3)); // 0.7を中立点とする緩やかな傾き
   }
+  // v1.10.0: その曜日に実際に終えた負荷が設定容量より多い／少ないなら、それに寄せる（3日以上の実績があるときだけ）。
+  // 「追加で生成」を押す人の容量は上がり、いつも余らせる人は下がる。
+  if (ws && ws.loadDays >= 3 && Number.isFinite(ws.loadRatio)) {
+    delta += Math.max(-0.15, Math.min(0.15, (ws.loadRatio - 1) * 0.25));
+  }
+  factor += Math.max(-CAPACITY_ADJUST_MAX_RATIO, Math.min(CAPACITY_ADJUST_MAX_RATIO, delta));
 
   // Loadは整数（SPEC §5）なので、容量も整数に丸める。小数のままだと
   // 画面に「10 / 10.1」のような読みにくい数字が出るうえ、
@@ -445,6 +451,7 @@ function countFinished(tasks, todayStr) {
  *   新しく入るものがあっても、すでに決めた選定は外さない（コロコロ入れ替えない）
  * @param {boolean} [args.forceExtra] 「追加で生成」用。上乗せ容量に収まらなくても、候補が残っていれば最低1件は追加する
  * @param {boolean} [args.diversity] 認知タイプ・問題集の偏り回避（既定true。検証用に切れる）
+ * @param {object|null} [args.learned] Store.deriveLearning()の結果。その人が「やり切れる」認知タイプ・負荷帯の傾向
  * @returns {{
  *   entries: Array<{id, load, pattern, deadline, src, overCapacity:boolean}>,
  *   effectiveCapacity: number,   // まだ使っていない残り予算（上乗せ込み）
@@ -472,6 +479,7 @@ export function buildTodayPlan({
   pinCapacity = null,
   forceExtra = false,
   diversity = true,
+  learned = null,
 }) {
   const weekday = new Date(todayStr + 'T00:00:00').getDay();
   const fullCapacity = computeEffectiveCapacity(baseCapacity, { weekday, weekdayStats });
@@ -539,9 +547,10 @@ export function buildTodayPlan({
       recentPenalty += Math.min(8, 3 * (finished.recent.books[t._book] || 0));
       recentPenalty += Math.min(4, 1.2 * (finished.recent.patterns[t._pattern] || 0));
     }
+    const followBonus = followBonusOf(t._pattern, learned);
     return {
-      task: t, deadlineScore, weekdayBonus, timeBonus, phaseBonus, pressureBonus,
-      value: Math.max(0.01, deadlineScore + weekdayBonus + timeBonus + phaseBonus + pressureBonus - recentPenalty + 1), // +1: 期限なしタスクにも僅かな基礎価値を与える
+      task: t, deadlineScore, weekdayBonus, timeBonus, phaseBonus, pressureBonus, followBonus,
+      value: Math.max(0.01, deadlineScore + weekdayBonus + timeBonus + phaseBonus + pressureBonus + followBonus - recentPenalty + 1), // +1: 期限なしタスクにも僅かな基礎価値を与える
     };
   });
   const scoreInfoById = new Map(scored.map((s) => [s.task.id, { deadlineScore: s.deadlineScore, weekdayBonus: s.weekdayBonus, timeBonus: s.timeBonus, phaseBonus: s.phaseBonus, pressureBonus: s.pressureBonus, phase: deadlinePhaseOf(s.task._daysUntil) }]));
@@ -620,7 +629,7 @@ export function buildTodayPlan({
   }
 
   let chosenSet = diversity
-    ? selectDiverse(pool, remainingCapacity, baseCounts, totalCapacity)
+    ? selectDiverse(pool, remainingCapacity, baseCounts, totalCapacity, heavyCapOf(learned))
     : knapsackSelect(pool, remainingCapacity);
 
   // 「追加で生成」: 上乗せ容量に収まる候補が無くても、最低1件は出す
@@ -681,6 +690,23 @@ export function buildTodayPlan({
       capacityOverridden: entries.some((e) => e.overCapacity),
     },
   };
+}
+
+/**
+ * その人が実際に「その日のうちに終えている」認知タイプを、わずかに優先する（学習した傾向）。
+ * 件数が少ないうちは効かせない（6件未満は0、20件で満額）。上限は±2.5と小さく、期限の近さは覆さない。
+ */
+function followBonusOf(pattern, learned) {
+  const f = learned && learned.patternFollow && learned.patternFollow[pattern];
+  if (!f || f.n < 6) return 0;
+  const weight = Math.min(1, f.n / 20);
+  return Math.max(-2.5, Math.min(2.5, (f.ratio - 0.7) * 8)) * weight;
+}
+
+/** 重い(負荷7以上)タスクをいつもやり切れない人は、1日1件までにする（実績が十分あるときだけ） */
+function heavyCapOf(learned) {
+  const h = learned && learned.heavyFollow;
+  return h && h.n >= 6 && h.ratio < 0.5 ? 1 : Infinity;
 }
 
 function urgencyRank(t) {
@@ -758,7 +784,7 @@ function improveOrder(list) {
  * それでも容量の35%以上が余るなら、一日が空っぽにならないよう上限をゆるめて埋める
  * （「できる限り」避ける、であって、候補が偏っている日に何も出さないことはしない）。
  */
-function selectDiverse(pool, capacity, base, totalCapacity) {
+function selectDiverse(pool, capacity, base, totalCapacity, maxHeavy = Infinity) {
   const cap = Math.max(0, Math.floor(capacity));
   if (cap <= 0 || !pool.length) return [];
   const patternLoadMax = Math.max(1, Math.floor(totalCapacity * PATTERN_SHARE_MAX));
@@ -792,6 +818,13 @@ function selectDiverse(pool, capacity, base, totalCapacity) {
         if (!victim || v.value < victim.value) victim = v;
       }
     });
+    if (Number.isFinite(maxHeavy)) {
+      const heavy = chosen.filter((x) => safeLoad(x.task.load) >= 7);
+      if (heavy.length > maxHeavy) {
+        const v = [...heavy].sort((a, b) => a.value - b.value)[0];
+        if (!victim || v.value < victim.value) victim = v;
+      }
+    }
     if (!victim) break;
     excluded.add(victim.task.id);
   }
@@ -799,7 +832,15 @@ function selectDiverse(pool, capacity, base, totalCapacity) {
   const left = cap - used;
   if (left >= Math.ceil(cap * (1 - MIN_FILL_RATIO)) && excluded.size) {
     const chosenIds = new Set(chosen.map((s) => s.task.id));
-    const extra = knapsackSelectScored(pool.filter((s) => !chosenIds.has(s.task.id)), left);
+    // 重いタスクを絞る傾向がある人には、ゆるめる段でも重いものは足さない（偏り回避とは別の理由の上限）
+    const heavyNow = chosen.filter((x) => safeLoad(x.task.load) >= 7).length;
+    const allowHeavy = !Number.isFinite(maxHeavy) || heavyNow < maxHeavy;
+    const extraPool = pool.filter((s) => !chosenIds.has(s.task.id) && (allowHeavy || safeLoad(s.task.load) < 7));
+    let extra = knapsackSelectScored(extraPool, left);
+    if (Number.isFinite(maxHeavy)) {
+      let room = Math.max(0, maxHeavy - heavyNow);
+      extra = extra.filter((x) => safeLoad(x.task.load) < 7 || (room-- > 0));
+    }
     chosen = chosen.concat(extra);
   }
   return chosen.map((s) => s.task);
