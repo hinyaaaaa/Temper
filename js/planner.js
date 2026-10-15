@@ -406,7 +406,7 @@ export function bookKeyOf(title) {
 }
 
 /** 今日済み／直近RECENT_DAYS日に済んだタスクの、認知タイプ・問題集ごとの件数（Plannerが tasks だけから数える） */
-function countFinished(tasks, todayStr) {
+function countFinished(tasks, todayStr, recentDone = null) {
   const out = { today: { patterns: {}, books: {} }, recent: { patterns: {}, books: {} } };
   const recentFrom = addDays(todayStr, -RECENT_DAYS);
   const bump = (bucket, t) => {
@@ -415,15 +415,28 @@ function countFinished(tasks, todayStr) {
     bucket.patterns[p] = (bucket.patterns[p] || 0) + 1;
     bucket.books[b] = (bucket.books[b] || 0) + 1;
   };
+  // 完了から24時間たった単発タスクは削除されるので、「直近の日」の完了は履歴(recentDone)からも数える。
+  // 同じ完了を二重に数えないよう、履歴にある (taskId, 日付) はタスク側では数えない。
+  const fromHistory = new Set();
+  (Array.isArray(recentDone) ? recentDone : []).forEach((h) => {
+    if (!h || !(h.date >= recentFrom && h.date < todayStr)) return;
+    if (h.taskId) fromHistory.add(h.taskId + '|' + h.date);
+    const p = h.pattern || (h.title ? estimatePatternGeneral(h.title, '') : 'unknown');
+    out.recent.patterns[p] = (out.recent.patterns[p] || 0) + 1;
+    if (h.title) {
+      const b = bookKeyOf(h.title);
+      out.recent.books[b] = (out.recent.books[b] || 0) + 1;
+    }
+  });
   tasks.forEach((t) => {
     if (t.type === 'weekly') {
       (Array.isArray(t.doneDates) ? t.doneDates : []).forEach((d) => {
         if (d === todayStr) bump(out.today, t);
-        else if (d >= recentFrom && d < todayStr) bump(out.recent, t);
+        else if (d >= recentFrom && d < todayStr && !fromHistory.has(t.id + '|' + d)) bump(out.recent, t);
       });
     } else if (t.done && t.doneDate) {
       if (t.doneDate === todayStr) bump(out.today, t);
-      else if (t.doneDate >= recentFrom && t.doneDate < todayStr) bump(out.recent, t);
+      else if (t.doneDate >= recentFrom && t.doneDate < todayStr && !fromHistory.has(t.id + '|' + t.doneDate)) bump(out.recent, t);
     }
   });
   return out;
@@ -478,11 +491,17 @@ export function buildTodayPlan({
   pinIds = null,
   pinCapacity = null,
   forceExtra = false,
+  fixedFullCapacity = null,
+  recentDone = null,
   diversity = true,
   learned = null,
 }) {
   const weekday = new Date(todayStr + 'T00:00:00').getDay();
-  const fullCapacity = computeEffectiveCapacity(baseCapacity, { weekday, weekdayStats });
+  // v1.11.1: 今日の容量(分母)は日中は動かさない。呼び出し側が「今日の最初の計算結果」を
+  // fixedFullCapacity として渡す。渡されなければ従来どおり実績から計算する。
+  const fullCapacity = Number.isFinite(fixedFullCapacity) && fixedFullCapacity >= 1
+    ? Math.round(fixedFullCapacity)
+    : computeEffectiveCapacity(baseCapacity, { weekday, weekdayStats });
   const bonus = Number.isFinite(capacityBonus) && capacityBonus > 0 ? Math.round(capacityBonus) : 0;
   const totalCapacity = fullCapacity + bonus;
   // effectiveCapacity: 「まだ使っていない残り予算」。今日すでに完了した分(alreadyDoneLoad)を
@@ -531,7 +550,7 @@ export function buildTodayPlan({
     : new Map();
 
   // 今日・直近に済んだものの偏り（同じ認知タイプ・問題集が続かないように）
-  const finished = diversity ? countFinished(tasks, todayStr) : null;
+  const finished = diversity ? countFinished(tasks, todayStr, recentDone) : null;
 
   const decided0 = new Set(entryById.keys());
   const undecided = candidates.filter((t) => !decided0.has(t.id));
@@ -563,13 +582,16 @@ export function buildTodayPlan({
   const isSoon = (t) => t.type !== 'weekly' && t._daysUntil > 0 && t._daysUntil <= SOON_DAYS;
   const pinnedKept = [];
   if (Array.isArray(pinIds) && pinIds.length) {
-    const lowered = Number.isFinite(pinCapacity) && totalCapacity < pinCapacity;
+    // v1.11.1: 固定した選定でも、今日の残り予算(effectiveCapacity)に収まる分だけを残す。
+    // 以前は容量を下げたときだけ絞っていたため、選定外のタスクを完了して消化分が増えても
+    // 残りが絞られず、「消化 + 残り」が容量を超えたまま（例: 18 / 15）になっていた。
+    // 完了済みの分は alreadyDoneLoad として差し引き済みなので、選定内のタスクを完了しただけでは何も外れない。
     let room = Math.max(0, effectiveCapacity - usedLoad);
     pinIds.forEach((id) => {
       const s = scoredById.get(id);
       if (!s || isSoon(s.task)) return; // 明日期限になったものは次のブロックで必ず入る
       const l = safeLoad(s.task.load);
-      if (!lowered || l <= room) {
+      if (l <= room) {
         room -= l;
         pinnedKept.push(s.task);
       }

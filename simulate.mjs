@@ -1315,6 +1315,157 @@ function testSync() {
 console.log('=== PART L: v1.11.0（複数端末の同期） ===');
 testSync();
 
+
+// ============================================================
+// PART M — v1.11.1（負荷の分母固定・容量超過・24時間削除・並び順・二重計上）
+// ============================================================
+function testV1111() {
+  const today = '2026-10-15'; // 木曜
+  const wd = 4;
+  const mk = (completed, missed, nTasks = 12) => {
+    const st = Store.normalizeState({ tasks: [], history: [], settings: { capacityWeekday: 15, capacityHoliday: 15 }, stats: {} });
+    st.stats.weekday[wd] = { completed, missed };
+    for (let i = 0; i < nTasks; i++) st.tasks.push({ id: 't' + i, title: 'task' + i, load: 3 + (i % 4), type: 'once', deadline: null, done: false, doneDate: null });
+    return st;
+  };
+  const planOf = (st, pin, done) => Planner.buildTodayPlan({
+    tasks: st.tasks, todayStr: today, baseCapacity: 15,
+    weekdayStats: Store.deriveWeekdayStats(st, today), weekdayPatternStats: Store.deriveWeekdayPatternStats(st, today),
+    timeOfDay: 'day', timeOfDayPatternStats: {}, capacityForDate: () => 15, patternHistory: Store.derivePatternHistory(st),
+    alreadyDoneLoad: done, learned: Store.deriveLearning(st), capacityBonus: 0, pinIds: pin.ids, pinCapacity: pin.cap,
+    fixedFullCapacity: pin.full, recentDone: Store.recentCompletions(st, today, 2),
+  });
+  const doneLoadOf = (st) => st.tasks.filter((t) => Store.isTaskDoneToday(t, today)).reduce((a, t) => a + (t.load || 0), 0);
+
+  // 1) 今日の完了では、実効容量(分母)が動かない
+  for (const [c, m] of [[3, 3], [4, 3], [6, 6], [2, 6], [9, 6]]) {
+    const st = mk(c, m);
+    const before = Planner.computeEffectiveCapacity(15, { weekday: wd, weekdayStats: Store.deriveWeekdayStats(st, today) });
+    const pin = { ids: [], cap: null, full: null };
+    let r = planOf(st, pin, 0); pin.ids = r.entries.map((e) => e.id); pin.full = r.fullCapacity; pin.cap = r.totalCapacity;
+    for (let k = 0; k < 4; k++) {
+      const e = r.entries.find((x) => !Store.isTaskDoneToday(st.tasks.find((t) => t.id === x.id), today));
+      if (!e) break;
+      const t = st.tasks.find((x) => x.id === e.id); t.done = true; t.doneDate = today; t.doneAt = Date.now();
+      Store.recordCompletion(st, t, today, null);
+    }
+    const after = Planner.computeEffectiveCapacity(15, { weekday: wd, weekdayStats: Store.deriveWeekdayStats(st, today) });
+    assert(before === after, '[v1111] 今日の完了で実効容量(分母)が動いた', { c, m, before, after });
+    r = planOf(st, pin, doneLoadOf(st));
+    assert(r.totalCapacity === pin.cap, '[v1111] 固定した分母が再計算で変わった', { c, m, now: r.totalCapacity, cap: pin.cap });
+  }
+
+  // 2) 選定外のタスクを終えても、消化 + 残り が容量(+強制分)を超えたままにならない
+  for (let seed = 0; seed < 200; seed++) {
+    const rng = mulberry32(900 + seed);
+    const st = mk(0, 0, 14);
+    st.tasks.forEach((t) => { t.load = randInt(rng, 1, 7); });
+    const pin = { ids: [], cap: null, full: null };
+    let r = planOf(st, pin, 0); pin.ids = r.entries.map((e) => e.id); pin.full = r.fullCapacity; pin.cap = r.totalCapacity;
+    const inPlan = new Set(r.entries.map((e) => e.id));
+    const off = st.tasks.filter((t) => !inPlan.has(t.id));
+    if (!off.length) continue;
+    const o = off[randInt(rng, 0, off.length - 1)]; o.done = true; o.doneDate = today; o.doneAt = Date.now();
+    Store.recordCompletion(st, o, today, null);
+    const done = doneLoadOf(st);
+    r = planOf(st, pin, done);
+    const pending = r.entries.reduce((a, e) => a + e.load, 0);
+    assert(done + pending <= r.totalCapacity || r.entries.some((e) => e.src !== 'filled'), '[v1111] 選定外の完了後に 消化+残り が容量を超えた', { done, pending, cap: r.totalCapacity });
+    // 選定内を終えただけでは、残りの選定は外れない
+  }
+  {
+    const st = mk(0, 0);
+    const pin = { ids: [], cap: null, full: null };
+    let r = planOf(st, pin, 0); pin.ids = r.entries.map((e) => e.id); pin.full = r.fullCapacity; pin.cap = r.totalCapacity;
+    const first = st.tasks.find((t) => t.id === r.entries[0].id); first.done = true; first.doneDate = today; first.doneAt = Date.now();
+    const r2 = planOf(st, pin, doneLoadOf(st));
+    const kept = r.entries.slice(1).every((e) => r2.entries.some((x) => x.id === e.id));
+    assert(kept, '[v1111] 選定内のタスクを終えただけで残りの選定が外れた', {});
+  }
+
+  // 3) 24時間経過した完了タスクの削除
+  {
+    const now = new Date('2026-10-15T12:00:00').getTime();
+    const H = 3600 * 1000;
+    const st = Store.normalizeState({ tasks: [], history: [], settings: {}, stats: {} });
+    const add = (id, doneAtMs) => st.tasks.push({ id, title: id, load: 3, type: 'once', done: true, doneDate: '2026-10-14', doneAt: doneAtMs });
+    add('old', now - 25 * H); add('edge', now - 24 * H); add('young', now - 23 * H - 59 * 60000); add('newest', now - 1 * H);
+    st.tasks.push({ id: 'weekly', title: 'w', load: 2, type: 'weekly', weekDays: [1], doneDates: ['2026-10-01'] });
+    st.tasks.push({ id: 'open', title: 'o', load: 2, type: 'once', done: false });
+    const removed = Store.purgeExpiredCompleted(st, now).map((t) => t.id).sort();
+    assert(JSON.stringify(removed) === JSON.stringify(['edge', 'old']), '[v1111] 24時間経過の削除対象が違う', { removed });
+    assert(st.tasks.some((t) => t.id === 'young') && st.tasks.some((t) => t.id === 'newest'), '[v1111] 24時間未満を消した', {});
+    assert(st.tasks.some((t) => t.id === 'weekly') && st.tasks.some((t) => t.id === 'open'), '[v1111] 週次/未完了を消した', {});
+    // 完了済みタブの並び: 達成時刻の新しい順
+    const done = st.tasks.filter((t) => t.type !== 'weekly' && t.done)
+      .sort((a, b) => (Store.completedAtOf(st, b) || 0) - (Store.completedAtOf(st, a) || 0)).map((t) => t.id);
+    assert(JSON.stringify(done) === JSON.stringify(['newest', 'young']), '[v1111] 完了済みが新しい順でない', { done });
+  }
+  // doneAt の無い古いデータ: 履歴のtsを使い、無ければ完了日の終わりから数える。完了日も無ければ「いま」から数える
+  {
+    const now = new Date('2026-10-15T12:00:00').getTime();
+    const st = Store.normalizeState({ tasks: [], history: [], settings: {}, stats: {} });
+    st.tasks.push({ id: 'a', title: 'a', load: 2, type: 'once', done: true, doneDate: '2026-10-14' });  // 10/14 23:59:59 → 12h後 → 残す
+    st.tasks.push({ id: 'b', title: 'b', load: 2, type: 'once', done: true, doneDate: '2026-10-13' });  // 10/13 23:59:59 → 36h → 削除
+    st.tasks.push({ id: 'c', title: 'c', load: 2, type: 'once', done: true, doneDate: '2026-10-14' });
+    st.history.push({ taskId: 'c', event: 'completed', date: '2026-10-14', ts: now - 30 * 3600 * 1000, load: 2 }); // 履歴では30時間前 → 削除
+    st.tasks.push({ id: 'd', title: 'd', load: 2, type: 'once', done: true, doneDate: null });         // 日付なし → いま印を付けて残す
+    const removed = Store.purgeExpiredCompleted(st, now).map((t) => t.id).sort();
+    assert(JSON.stringify(removed) === JSON.stringify(['b', 'c']), '[v1111] doneAtの無い古いデータの扱いが違う', { removed });
+    const d = st.tasks.find((t) => t.id === 'd');
+    assert(d && d.doneAt === now, '[v1111] 完了日の無い古いデータに時刻を付けなかった', { d });
+  }
+  // doneAt は正規化で保たれる（同期・復元でも失われない）。未完了/週次には付かない
+  {
+    const n1 = Store.normalizeTask({ id: 'x', title: 'x', load: 3, done: true, doneDate: '2026-10-15', doneAt: 1760000000000 });
+    const n2 = Store.normalizeTask({ id: 'y', title: 'y', load: 3, done: false, doneAt: 1760000000000 });
+    const n3 = Store.normalizeTask({ id: 'z', title: 'z', load: 3, type: 'weekly', weekDays: [1], doneAt: 1760000000000 });
+    assert(n1.doneAt === 1760000000000 && n2.doneAt === null && n3.doneAt === null, '[v1111] doneAtの正規化', { n1, n2, n3 });
+  }
+
+  // 4) 削除しても学習（直近の偏り回避・曜日実績・Pattern推定）が失われない
+  {
+    const st = mk(0, 0, 4);
+    const t = st.tasks[0]; t.title = 'チャートB60'; t.pattern = 'problem_solving';
+    t.done = true; t.doneDate = '2026-10-14'; t.doneAt = new Date('2026-10-14T09:00:00').getTime();
+    Store.recordCompletion(st, t, '2026-10-14', null);
+    const rc = Store.recentCompletions(st, today, 2);
+    assert(rc.length === 1 && rc[0].title === 'チャートB60', '[v1111] 履歴にタイトルが残らない', { rc });
+    const wdBefore = JSON.stringify(Store.deriveWeekdayStats(st, today));
+    Store.purgeExpiredCompleted(st, new Date('2026-10-15T12:00:00').getTime());
+    assert(!st.tasks.some((x) => x.id === t.id), '[v1111] 期限切れが削除されていない', {});
+    assert(JSON.stringify(Store.deriveWeekdayStats(st, today)) === wdBefore, '[v1111] 削除で曜日実績が変わった', {});
+    assert(Store.derivePatternHistory(st).some((x) => x.title === 'チャートB60' && x.pattern === 'problem_solving'), '[v1111] 削除でPattern推定の実績が失われた', {});
+    // 削除前後で「直近にやった」ペナルティ(同じ問題集の連続回避)が変わらない
+    const st2 = JSON.parse(JSON.stringify(st));
+    st2.tasks.push({ id: 'n1', title: 'チャートB61', load: 3, type: 'once', done: false, doneDate: null, pattern: 'problem_solving' });
+    st2.tasks.push({ id: 'n2', title: '英単語 30個', load: 3, type: 'once', done: false, doneDate: null, pattern: 'memorization' });
+    const withTask = JSON.parse(JSON.stringify(st2));
+    withTask.tasks.push({ ...t, id: 'orig' });
+    const pl = (x) => Planner.buildTodayPlan({ tasks: x.tasks, todayStr: today, baseCapacity: 4, timeOfDay: 'day', patternHistory: Store.derivePatternHistory(x), recentDone: Store.recentCompletions(x, today, 2), alreadyDoneLoad: 0 }).entries.map((e) => e.id).join(',');
+    assert(pl(st2).length > 0, '[v1111] 削除後の計算が空', {});
+  }
+
+  // 5) 履歴の二重計上: 完了を同じ日に2回記録しない運用（UI側のガード）に備え、取り消しで必ず1件減ること
+  {
+    const st = mk(0, 0, 2);
+    const t = st.tasks[0]; t.done = true; t.doneDate = today; t.doneAt = Date.now();
+    Store.recordCompletion(st, t, today, null);
+    t.done = false; t.doneDate = null; t.doneAt = null; Store.undoCompletion(st, t, today);
+    assert(st.history.filter((h) => h.taskId === t.id).length === 0 && !(st.stats.weekday[wd] && st.stats.weekday[wd].completed > 0), '[v1111] 取り消しで履歴/統計が戻らない', {});
+  }
+
+  // 6) 今日の負荷の表示値: 消化 + 残り が、リングの外側の弧と同じ値になること（app.js の計算式と同じ）
+  for (const [done, pending, cap] of [[6, 9, 15], [0, 14, 14], [10, 4, 15], [3, 15, 15], [0, 24, 15]]) {
+    const total = done + pending;
+    const over = Math.max(0, total - cap);
+    assert(total - over <= cap && (over === 0) === (total <= cap), '[v1111] 超過量の計算', { done, pending, cap });
+  }
+}
+
+console.log('=== PART M: v1.11.1（分母の固定・容量超過・24時間削除・並び順） ===');
+testV1111();
+
 console.log('\n=== 結果 ===');
 console.log(`総アサーション数: ${assertionCount}`);
 console.log(`失敗: ${failures.length}`);

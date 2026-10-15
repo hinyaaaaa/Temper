@@ -14,6 +14,7 @@ import * as Forecast from './forecast.js';
 import * as Schedule from './schedule.js';
 import { createSyncEngine, historyCutoff } from './sync-core.js';
 import { createSky } from './skyrender.js';
+import { initViewport, viewportDebugHtml } from './viewport.js';
 
 /* ------------------------------------------------------------
    状態
@@ -27,7 +28,7 @@ let pendingImport = null;  // インポート確認中のデータ
 let upcomingDay = 1;       // 予定タブで選んでいる日（1=明日 … 7=7日後）
 
 /** 設定タブに小さく表示するだけの表示用バージョン。改修のたびに上げる。 */
-const APP_VERSION = 'v1.11.0';
+const APP_VERSION = 'v1.11.1';
 
 const todayStr = () => {
   const d = new Date();
@@ -83,7 +84,7 @@ function computeDoneLoadToday(dateStr) {
    日付が変われば作り直す。state・バックアップには含めない（その日限りの派生値）。
    ------------------------------------------------------------ */
 const PLAN_PIN_KEY = 'temper-plan-pin';
-let planPin = null; // { date, ids: string[], bonus: number, cap: number|null }
+let planPin = null; // { date, ids: string[], bonus: number, cap: number|null, full: number|null, base: number|null }
 
 function loadPlanPin(today) {
   if (planPin && planPin.date === today) return planPin;
@@ -94,7 +95,10 @@ function loadPlanPin(today) {
         date: today,
         ids: v.ids.filter((x) => typeof x === 'string'),
         bonus: Number.isFinite(v.bonus) && v.bonus > 0 ? Math.round(v.bonus) : 0,
-        cap: Number.isFinite(v.cap) ? v.cap : null, // 保存した時点の今日の容量。これより下がったときだけ選定を絞る
+        cap: Number.isFinite(v.cap) ? v.cap : null, // 保存した時点の今日の容量(分母)。下の full + bonus
+        // v1.11.1: 今日の実効容量(上乗せ前)と、そのときの設定容量。設定が変わらない限り日中は動かさない。
+        full: Number.isFinite(v.full) ? v.full : null,
+        base: Number.isFinite(v.base) ? v.base : null,
       };
       return planPin;
     }
@@ -102,7 +106,7 @@ function loadPlanPin(today) {
   // 新しい日の最初の呼び出し: 前日の選定をここで学習に数えてから作り直す
   // （アプリを開き直した・日をまたいだ、どの入口からでも前日分を取りこぼさない）
   if (Store.recordDayFollowThrough && settlePreviousDayQuiet(today)) persist();
-  planPin = { date: today, ids: [], bonus: 0, cap: null };
+  planPin = { date: today, ids: [], bonus: 0, cap: null, full: null, base: null };
   return planPin;
 }
 function savePlanPin() {
@@ -118,12 +122,18 @@ function recomputeTodayPlan({ forceExtra = false } = {}) {
   const today = todayStr();
   const pin = loadPlanPin(today);
   const doneLoad = computeDoneLoadToday(today);
+  // 今日の容量(分母)は日中は固定する。ユーザーが容量・平日/休日を変えたとき（設定容量が
+  // 変わったとき）だけ計算し直す。完了のたびに実績補正で 14→15 のように動くのを防ぐ。
+  const baseCap = Store.getCapacityFor(state, today);
+  const fixedFull = Number.isFinite(pin.full) && pin.base === baseCap ? pin.full : null;
   currentTodayPlan = Planner.buildTodayPlan({
     tasks: state.tasks,
     todayStr: today,
-    baseCapacity: Store.getCapacityFor(state, today),
-    weekdayStats: Store.deriveWeekdayStats(state),
-    weekdayPatternStats: Store.deriveWeekdayPatternStats(state),
+    baseCapacity: baseCap,
+    fixedFullCapacity: fixedFull,
+    recentDone: Store.recentCompletions(state, today, 2),
+    weekdayStats: Store.deriveWeekdayStats(state, today),
+    weekdayPatternStats: Store.deriveWeekdayPatternStats(state, today),
     timeOfDay: Weather.getTimeOfDay(),
     timeOfDayPatternStats: Store.deriveTimeOfDayPatternStats(state, {
       bucketOf: Weather.getTimeOfDay,
@@ -153,6 +163,8 @@ function recomputeTodayPlan({ forceExtra = false } = {}) {
     const needed = doneLoad + pendingLoad - currentTodayPlan.fullCapacity;
     if (needed > pin.bonus) { pin.bonus = needed; bonusRaised = true; }
   }
+  pin.full = currentTodayPlan.fullCapacity;
+  pin.base = baseCap;
   pin.cap = currentTodayPlan.fullCapacity + pin.bonus;
   savePlanPin();
   if (bonusRaised) recomputeTodayPlan();
@@ -188,6 +200,20 @@ function settlePreviousDay(today, patternOf) {
   return false;
 }
 function settlePreviousDayQuiet(today) { return settlePreviousDay(today, makePatternOf()); }
+
+/**
+ * 完了から24時間以上たった単発タスクを削除する（v1.11.1）。
+ * 前日分の「やったか」の集計(settlePreviousDay)は日付が変わった最初の計算で済ませてから
+ * 消す必要があるので、必ず recomputeTodayPlan()/ensureTodayPlanFresh() の後に呼ぶ。
+ * 同期中は persist() が削除（墓標）を他の端末へ送る。
+ * @returns {boolean} 1件でも削除したか
+ */
+function purgeExpiredCompleted() {
+  const removed = Store.purgeExpiredCompleted(state, Date.now());
+  if (!removed.length) return false;
+  persist();
+  return true;
+}
 
 /**
  * 日付が変わっていたら（アプリを閉じずに日をまたいだ場合など）
@@ -303,7 +329,7 @@ function renderTodayPage() {
   // などで plan が再計算されても、既に完了したタスクの負荷値が
   // 消えてしまうことがない（plan.entries に残っているかどうかに
   // 依存しないため）。
-  const pendingEntries = plan.entries.filter((e) => !isTaskDoneToday(e.id, today));
+  const pendingEntries = plan.entries.filter((e) => isPendingEntry(e, today));
   const doneLoad = computeDoneLoadToday(today);
   // plan.totalLoad は「完了前に選ばれた時点」の合計なので、完了後も
   // そのまま使うと doneLoad と二重に数えてしまう（完了させても
@@ -312,6 +338,8 @@ function renderTodayPage() {
   // 合計し直すことで二重計上を避ける。
   const pendingLoad = pendingEntries.reduce((sum, e) => sum + e.load, 0);
   const totalLoad = doneLoad + pendingLoad;
+  // 表示の「今日の負荷」は 消化 + 残り（リングの外側の弧と同じ値）。以前は残りだけを分子にしていたため、
+  // 消化がある日は文字(例 9 / 15)とリング(満杯)が食い違って見えた。
   // 分母は「今日1日の目標容量」(fullCapacity)。plan.effectiveCapacity は
   // Plannerが残りタスクを選ぶ際に使った「まだ使っていない予算」
   // （fullCapacityからdoneLoadを引いたもの）なので、表示の分母には使わない
@@ -322,6 +350,10 @@ function renderTodayPage() {
   const frac = (v) => (capacity > 0 ? Math.min(1, v / capacity) : 0);
   const plannedOffset = C * (1 - frac(totalLoad));
   const doneOffset = C * (1 - frac(doneLoad));
+  // 容量を超えた分は、内側の細いリングで見せる（外側は100%で頭打ちになり、超過が見えなかった）
+  const overLoad = capacity > 0 ? Math.max(0, totalLoad - capacity) : 0;
+  const C2 = 2 * Math.PI * 17;
+  const overOffset = C2 * (1 - Math.min(1, overLoad / capacity));
 
   const finishLabel = estimateAllTasksFinishLabel(today, doneLoad);
 
@@ -352,10 +384,11 @@ function renderTodayPage() {
           <circle class="load-ring-track" cx="27" cy="27" r="23"/>
           ${totalLoad > 0 ? `<circle class="load-ring-planned" cx="27" cy="27" r="23" stroke-dasharray="${C}" stroke-dashoffset="${plannedOffset}" transform="rotate(-90 27 27)"/>` : ''}
           ${doneLoad > 0 ? `<circle class="load-ring-done" cx="27" cy="27" r="23" stroke-dasharray="${C}" stroke-dashoffset="${doneOffset}" transform="rotate(-90 27 27)"/>` : ''}
+          ${overLoad > 0 ? `<circle class="load-ring-over" cx="27" cy="27" r="17" stroke-dasharray="${C2}" stroke-dashoffset="${overOffset}" transform="rotate(-90 27 27)"/>` : ''}
         </svg>
         <div class="progress-text">
-          <div class="progress-value">今日の負荷　<b>${pendingLoad}</b> / ${capacity}</div>
-          <div class="progress-sub">${pendingEntries.length}件が残っています${doneLoad > 0 ? `　（消化 ${doneLoad}）` : ''}</div>
+          <div class="progress-value">今日の負荷　<b>${totalLoad}</b> / ${capacity}</div>
+          <div class="progress-sub">${pendingEntries.length}件が残っています${doneLoad > 0 ? `　（消化 ${doneLoad}）` : ''}${overLoad > 0 ? `　超過 +${overLoad}` : ''}</div>
           ${finishLabel ? `<div class="progress-finish">全タスク完了目安 ${finishLabel}</div>` : ''}
         </div>
       </div>
@@ -377,7 +410,7 @@ function renderTodayPage() {
 function computeProjection() {
   const today = todayStr();
   if (!currentTodayPlan || currentPlanDate !== today) recomputeTodayPlan();
-  const pendingIds = currentTodayPlan.entries.filter((e) => !isTaskDoneToday(e.id, today)).map((e) => e.id);
+  const pendingIds = currentTodayPlan.entries.filter((e) => isPendingEntry(e, today)).map((e) => e.id);
   return Schedule.projectDays({
     tasks: state.tasks,
     todayStr: today,
@@ -457,6 +490,12 @@ function estimateAllTasksFinishLabel(today, doneLoad) {
   return `${d.getMonth() + 1}/${d.getDate()}（${w}）`;
 }
 
+/** 今日の選定のうち、まだ終えていないもの。削除されたタスク（24時間経過で自動削除）は含めない */
+function isPendingEntry(entry, today) {
+  const t = state.tasks.find((x) => x.id === entry.id);
+  return !!t && !Store.isTaskDoneToday(t, today);
+}
+
 /** 「今日」という日付の時点で済んでいるか（plan.entriesに依存しない） */
 function isTaskDoneToday(taskId, dateStr) {
   const t = state.tasks.find((x) => x.id === taskId);
@@ -503,6 +542,15 @@ function renderTaskCard(entryOrTask, opts = {}) {
   } else if (t.deadline) {
     const days = daysUntilFromToday(t.deadline);
     chips.push(`<span class="task-meta-chip${days <= 1 ? ' urgent' : ''}">${deadlineLabel(days)}</span>`);
+  }
+  if (opts.withActions && t.type !== 'weekly' && t.done) {
+    const at = Store.completedAtOf(state, t);
+    if (at) {
+      const d = new Date(at);
+      const remain = at + Store.COMPLETED_TTL_MS - Date.now();
+      const left = remain <= 3600000 ? 'まもなく削除' : `あと${Math.ceil(remain / 3600000)}時間で削除`;
+      chips.unshift(`<span class="task-meta-chip">完了 ${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}・${left}</span>`);
+    }
   }
   if (t.unlockDate && t.unlockDate > today) {
     chips.push(`<span class="task-meta-chip">${formatDateLabel(t.unlockDate)}から</span>`);
@@ -606,9 +654,12 @@ function closeDetailSheet() { document.getElementById('detail-sheet').classList.
    打ち消す。これを怠ると、完了→取り消し→再完了を繰り返すたびに
    historyへエントリが積み重なってしまう。
    ------------------------------------------------------------ */
+const completingIds = new Set(); // 完了演出中(320ms)のタスク。二重タップでの二重完了を防ぐ
+
 function toggleTask(taskId) {
   const t = state.tasks.find((x) => x.id === taskId);
   if (!t) return;
+  if (completingIds.has(taskId)) return;
   const today = todayStr();
   // 「今完了しているか」は isTaskComplete（完了日に関わらない永続状態）
   // で判定する。isTaskDoneToday（今日完了したかどうか）で判定すると、
@@ -627,6 +678,7 @@ function toggleTask(taskId) {
     } else {
       t.done = false;
       t.doneDate = null;
+      t.doneAt = null;
     }
     Store.undoCompletion(state, t, completionDate);
     persist();
@@ -637,16 +689,22 @@ function toggleTask(taskId) {
 
   const cardEl = document.querySelector(`.task-card[data-task-id="${taskId}"]`);
   if (cardEl && currentPage === 'today') cardEl.classList.add('completing');
+  completingIds.add(taskId);
   const finish = () => {
+    completingIds.delete(taskId);
+    // 今日の選定に入っていなかったタスクを終えた場合、消化分が増えた分だけ残りを絞り直す必要がある
+    const wasInPlan = !!(currentTodayPlan && currentTodayPlan.entries.some((e) => e.id === taskId));
     if (t.type === 'weekly') {
       t.doneDates = t.doneDates || [];
       if (!t.doneDates.includes(today)) t.doneDates.push(today);
     } else {
       t.done = true;
       t.doneDate = today;
+      t.doneAt = Date.now();
     }
     Store.recordCompletion(state, t, today, makePatternOf());
     persist();
+    if (!wasInPlan) recomputeTodayPlan();
     render();
   };
   if (cardEl && currentPage === 'today') setTimeout(finish, 320);
@@ -678,7 +736,10 @@ function sortTasksForList(list) {
 function renderTasksPage() {
   const active = state.tasks.filter((t) => t.type === 'weekly' || !t.done);
   const done = state.tasks.filter((t) => t.type !== 'weekly' && t.done);
-  const list = sortTasksForList(taskFilter === 'active' ? active : done);
+  // 完了済みは「達成した時刻の新しい順」。24時間たつと自動で消えるので、並び替えの切替は出さない。
+  const list = taskFilter === 'active'
+    ? sortTasksForList(active)
+    : done.slice().sort((a, b) => (Store.completedAtOf(state, b) || 0) - (Store.completedAtOf(state, a) || 0));
 
   const listHtml = list.length
     ? list.map((t) => renderTaskCard(t, { withActions: true })).join('')
@@ -692,10 +753,10 @@ function renderTasksPage() {
       <button class="${taskFilter === 'active' ? 'active' : ''}" onclick="Temper.setTaskFilter('active')">未完了 ${active.length}</button>
       <button class="${taskFilter === 'done' ? 'active' : ''}" onclick="Temper.setTaskFilter('done')">完了済み ${done.length}</button>
     </div>
-    <div class="segmented" style="margin:0 0 var(--sp-3)">
+    ${taskFilter === 'active' ? `<div class="segmented" style="margin:0 0 var(--sp-3)">
       <button class="${taskSort === 'deadline' ? 'active' : ''}" onclick="Temper.setTaskSort('deadline')">期限順</button>
       <button class="${taskSort === 'load' ? 'active' : ''}" onclick="Temper.setTaskSort('load')">負荷順</button>
-    </div>
+    </div>` : `<div class="settings-desc" style="margin:0 var(--sp-1) var(--sp-3)">達成から24時間たつと自動で削除されます（新しい順）</div>`}
     <div>${listHtml}</div>
   `;
 }
@@ -820,7 +881,7 @@ function saveTaskFromModal() {
         // ただの編集（種別は変えていない）で完了状態を消してしまわないよう、
         // 変わっていないときはtouchしない。
         t.doneDates = [];
-        t.done = false; t.doneDate = null;
+        t.done = false; t.doneDate = null; t.doneAt = null;
       }
       t.pattern = Planner.estimatePattern(title, t.description, Store.derivePatternHistory(state));
     }
@@ -921,6 +982,7 @@ function renderSettingsPage() {
     ${renderSyncCard()}
 
     <div class="settings-version">Temper ${APP_VERSION}</div>
+    ${viewportDebugHtml(esc)}
   `;
 }
 
@@ -1111,7 +1173,7 @@ function refreshSky({ snap = false } = {}) {
     }
     const plan = currentTodayPlan;
     const pendingLoad = plan.entries
-      .filter((e) => !isTaskDoneToday(e.id, today))
+      .filter((e) => isPendingEntry(e, today))
       .reduce((sum, e) => sum + e.load, 0);
     const f = Forecast.computePressure({
       tasks: state.tasks,
@@ -1365,8 +1427,10 @@ function init() {
   init._ran = true;
   try {
     recomputeTodayPlan();
+    purgeExpiredCompleted(); // 前日分の集計(上の再計算内)を済ませたあとで、24時間経過した完了タスクを消す
     initSky();
     render();
+    initViewport(); // iPhoneのホーム画面アプリで下端に帯が出る不具合の検出・回復（viewport.js）
     Store.requestPersistentStorage();
     registerOfflineSupport();
     // 同期は、バックアップからの復元が終わってから始める（空の状態を「全削除」として送らないため）
@@ -1377,6 +1441,8 @@ function init() {
     let hiddenAt = 0;
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) { hiddenAt = Date.now(); return; }
+      ensureTodayPlanFresh();
+      if (purgeExpiredCompleted() && (currentPage === 'tasks' || currentPage === 'today')) render();
       if (currentPage === 'upcoming') render(); // 戻ってきたら最新の状況で並べ直す
       refreshSky({ snap: hiddenAt && Date.now() - hiddenAt > 10 * 60 * 1000 });
     });
@@ -1391,6 +1457,10 @@ function init() {
         ensureTodayPlanFresh();
         if (currentPage === 'today') render();
       }
+      // 完了から24時間たったタスクを消す（日付の確認の後。前日分の集計を先に済ませるため）
+      if (purgeExpiredCompleted() && currentPage === 'tasks') render();
+      // 完了済みタブの「あと◯時間で削除」も、時間が進んだ分を反映する
+      else if (currentPage === 'tasks' && taskFilter === 'done') render();
       // 予定タブは、時間が進んだ分（日付・曜日・解禁日など）も含めて最新の状況で並べ直す
       if (currentPage === 'upcoming') render();
     }, 60 * 1000);

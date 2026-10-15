@@ -604,3 +604,44 @@ WebGL2の対応状況（iOS 15未満は退避表示になる）。重い場合�
 - `node simulate.mjs`: 350,301件、全件通過（Part L: 2端末＋偽クラウド。追加・完了・削除の伝播、エコー抑止、オフライン中の同時編集の収束、未送信の手元の変更を保護、設定、履歴と統計の差分、取り消しの伝播、全削除の安全弁、壊れた文書、ハッシュのキー順非依存）。
 - headless Chrome: 構成の貼り付け（コンソールの `const firebaseConfig = {...}` をそのまま）→保存→SDK読み込み失敗時もアプリが動く。
 - **未検証（要・実機/実プロジェクト）**: 実際のFirebaseプロジェクトでの認証・Firestoreの読み書き・2台間のリアルタイム反映。サンドボックスからFirebaseへ通信できないため。`sync-firebase.js` はSDK 11.0.2 のモジュラーAPIに合わせて書いたが、実機で初回に確認すること。うまく動かないとき、設定画面の「同期」にエラーコードが出る（`permission-denied`=ルール未設定、`auth/...`=認証）。
+
+---
+
+## 16. v1.11.1 — iPhoneホーム画面アプリで下端に単色の帯が出る不具合（viewport.js）
+
+- 症状（実機スクリーンショットの画素計測）: #sky・#app（position:fixed; inset:0）が画面より約61pt短い高さで切れ、
+  その下は html の背景色だけになる。ナビは帯の上端から 34(safe-bottom)+14(nav-gap) の位置にあり、
+  env(safe-area-inset-bottom) は正常。横幅・文字サイズは正常（ズームではない）。再起動で消えることも残ることもある。
+- 結論: WebViewの枠ではなく「レイアウトビューポートの高さが古いまま」になっている。引き金（キーボード/復帰/起動時）は未特定。
+- 対処: js/viewport.js を追加。screen.height と innerHeight の差を検出し、viewportメタの再設定・scrollTo・resize発火で
+  取り直す（最大3回）。直らない間は --vv-gap でナビ/FAB/トーストを帯の上に収める。
+  ずれが起きた瞬間の数値は localStorage('temper-vp-log') に残し、設定タブ末尾に（ずれが記録されたときだけ）表示する。
+- 実機確認が必要: standaloneで通常時 innerHeight が screen.height と一致するか（一致しない機種では検出が常時trueになる）、
+  nudge()で実際に帯が消えるか。次に帯が出たら設定タブ末尾のログ（起動/復帰/focusoutのどれで出たか）を確認する。
+
+---
+
+## 17. v1.11.1 — 負荷表示の不一致・24時間経過した完了タスクの自動削除
+
+### 17.1 今日の負荷（数字とリング）の不一致 — 原因と修正
+1. 文字は「残りだけ / 容量」、リングの外側は「消化+残り / 容量」と別物だった → 文字を「消化+残り / 容量」に統一（消化は括弧で併記）。
+2. 今日の完了が stats.weekday.completed に即加算され、deriveWeekdayStats の completedRatio（今日の曜日の実効容量=分母の補正）に今日分が入っていた
+   → 日中に分母が 14→15 のように動いた。今日の完了を completedRatio から除外（deriveWeekdayStats / deriveWeekdayPatternStats に today を渡す）。
+   さらに今日の実効容量は pin.full/pin.base に保存し、設定容量(平日/休日含む)が変わらない限り fixedFullCapacity として固定。
+3. 選定外のタスクを終えても plan が再計算されず、再計算しても固定済みの選定が絞られなかった（18 / 15）
+   → 選定外の完了時は recomputeTodayPlan() を呼び、固定済みの選定も常に「今日の残り予算」に収まる分だけ残す（planner.js）。
+   選定内のタスクを終えただけでは何も外れない（消化に移るだけで合計が変わらないため）。
+4. 容量超過（期限の強制採用など）はリングが100%で頭打ちで見えなかった → 内側の細いリング＋「超過 +N」を追加。
+5. 完了ボタンの二重タップ（演出320ms中）で完了が二重に記録された → completingIds で防止、.completing に pointer-events:none。
+
+### 17.2 完了から24時間たった単発タスクの自動削除
+- 単発タスクに doneAt（完了した瞬間のms）を追加。完了で付け、取り消しで消す。週次は対象外（終わりのないシリーズ）。
+- Store.purgeExpiredCompleted(state, now) が 24時間以上経過したものを state.tasks から削除。起動時・1分ごと・アプリ復帰時に app.js の purgeExpiredCompleted() が呼ぶ。
+  **前日分の集計(settlePreviousDay)・missed記録の後に呼ぶこと**（先に消すと「やったか」の学習から落ちる）。
+- doneAt が無い古いデータ: 履歴の ts → 完了日の23:59:59 の順で推定。完了日も無ければ「いま」を記録してそこから24時間数える。
+- 学習・統計は history/stats に残るので失われない。そのために history に title を追加（recordCompletion）。
+  derivePatternHistory と、直近の偏り回避(countFinished の recentDone)は履歴からも引く。
+- 同期: 削除は既存の墓標(deletedAt)として他端末へ伝わる。
+- 完了済みタブ: 達成時刻の新しい順（並び替えボタンは出さない）。各カードに「完了 月/日 時:分・あとN時間で削除」。
+- simulate.mjs に Part M を追加（分母の不変・選定外完了後の合計・24時間境界・古いデータ・並び順・学習の保持）。総アサーション 35万件超すべて通過。
+- jsdom による起動スモークテストで、今日/タスク/予定/設定の描画にエラーが出ないことを確認済み。実機（iPhone）での確認は未実施。

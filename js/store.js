@@ -180,6 +180,9 @@ export function normalizeTask(t) {
       : [],
     done: type === 'weekly' ? false : !!t.done,
     doneDate: type === 'weekly' ? null : (t.doneDate || null),
+    // v1.11.1: 単発タスクを完了した瞬間（ms）。24時間経過後の自動削除と、完了済みタブの
+    // 「達成時間の新しい順」の並びに使う。古いデータ（無い場合）は purgeExpiredCompleted が補う。
+    doneAt: type === 'weekly' || !t.done ? null : (Number(t.doneAt) > 0 ? Math.round(Number(t.doneAt)) : null),
     pattern: t.pattern || null,
     createdAt: Number(t.createdAt) || Date.now(),
   };
@@ -528,6 +531,9 @@ export function recordCompletion(state, task, completedOn, patternOf = null) {
   state.history.push({
     taskId: task.id, event: 'completed', pattern,
     load: task.load, deadline: task.deadline, date: completedOn, ts: Date.now(),
+    // v1.11.1: 完了タスクは24時間後に削除するため、「直近に何をやったか」「タイトルからのPattern推定」を
+    // タスク本体ではなく履歴からも引けるように、タイトルを残す。
+    title: task.title,
   });
 }
 
@@ -644,9 +650,16 @@ export function recordMissedOccurrencesUntilToday(state, todayStr, patternOf = n
    ------------------------------------------------------------ */
 export function deriveWeekdayStats(state, todayStr = null) {
   const out = {};
+  // v1.11.1: 今日の完了は completedRatio に含めない。含めると、今日タスクを終えるたびに
+  // 今日の曜日の実効容量（分母）が動き、「14 / 14 → 15」のように日中に分母が変わっていた。
+  // missed は日付が変わってから数えるので、今日分を除いた方が分子・分母がそろう。
+  const todayKey = todayStr || localDateStr(new Date());
+  const todayWd = new Date(todayKey + 'T00:00:00').getDay();
+  const todayDone = todayCompletedCount(state, todayKey);
   Object.entries(state.stats.weekday).forEach(([wd, v]) => {
-    const total = (v.completed || 0) + (v.missed || 0);
-    if (total > 0) out[wd] = { completedRatio: v.completed / total, samples: total };
+    const completed = Math.max(0, (v.completed || 0) - (Number(wd) === todayWd ? todayDone.all : 0));
+    const total = completed + (v.missed || 0);
+    if (total > 0) out[wd] = { completedRatio: completed / total, samples: total };
   });
 
   // v1.10.0: 曜日ごとの「実際に終えた負荷」（直近8週・今日を除く）を、設定の容量と比べる。
@@ -674,13 +687,29 @@ export function deriveWeekdayStats(state, todayStr = null) {
   return out;
 }
 
-export function deriveWeekdayPatternStats(state) {
+export function deriveWeekdayPatternStats(state, todayStr = null) {
   const out = {};
+  const todayKey = todayStr || localDateStr(new Date());
+  const todayWd = new Date(todayKey + 'T00:00:00').getDay();
+  const todayDone = todayCompletedCount(state, todayKey);
   Object.entries(state.stats.weekdayPattern).forEach(([key, v]) => {
-    const total = (v.completed || 0) + (v.missed || 0);
-    if (total > 0) out[key] = { completedRatio: v.completed / total, samples: total };
+    const sub = key.startsWith(todayWd + ':') ? (todayDone.byPattern[key.slice(String(todayWd).length + 1)] || 0) : 0;
+    const completed = Math.max(0, (v.completed || 0) - sub);
+    const total = completed + (v.missed || 0);
+    if (total > 0) out[key] = { completedRatio: completed / total, samples: total };
   });
   return out;
+}
+
+/** 今日完了した件数（history から）。全体と Pattern 別。 */
+function todayCompletedCount(state, todayKey) {
+  const all = { all: 0, byPattern: {} };
+  (state.history || []).forEach((h) => {
+    if (!h || h.event !== 'completed' || h.date !== todayKey) return;
+    all.all += 1;
+    if (h.pattern) all.byPattern[h.pattern] = (all.byPattern[h.pattern] || 0) + 1;
+  });
+  return all;
 }
 
 /**
@@ -718,7 +747,70 @@ export function deriveTimeOfDayPatternStats(state, { bucketOf, estimatePattern }
 }
 
 export function derivePatternHistory(state) {
-  return state.tasks.filter((t) => t.pattern).map((t) => ({ title: t.title, pattern: t.pattern }));
+  const out = state.tasks.filter((t) => t.pattern).map((t) => ({ title: t.title, pattern: t.pattern }));
+  // 完了して24時間たったタスクは削除されるので、そのタイトル→Patternの実績は履歴から補う
+  const seen = new Set(out.map((x) => x.title + '\u0000' + x.pattern));
+  (state.history || []).forEach((h) => {
+    if (!h || h.event !== 'completed' || !h.title || !h.pattern) return;
+    const k = h.title + '\u0000' + h.pattern;
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push({ title: h.title, pattern: h.pattern });
+  });
+  return out;
+}
+
+/** 直近 days 日（今日を除く）に完了したものを、履歴から [{ date, taskId, pattern, title }] で返す */
+export function recentCompletions(state, todayStr, days = 2) {
+  const from = addDaysStr(todayStr, -days);
+  return (state.history || [])
+    .filter((h) => h && h.event === 'completed' && typeof h.date === 'string' && h.date >= from && h.date < todayStr)
+    .map((h) => ({ date: h.date, taskId: h.taskId || null, pattern: h.pattern || null, title: h.title || null }));
+}
+
+/* ------------------------------------------------------------
+   完了から24時間たった単発タスクの自動削除（v1.11.1）
+   ------------------------------------------------------------
+   週次タスクは終わりのないシリーズなので対象外。学習・統計は history/stats に
+   残るので、タスク本体を消しても曜日別の実績や時間帯の学習は失われない。
+   ------------------------------------------------------------ */
+export const COMPLETED_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** 単発タスクの完了時刻(ms)。doneAt → 履歴のts → 完了日の終わり、の順に探す。無ければ null */
+export function completedAtOf(state, task) {
+  if (task.type === 'weekly' || !task.done) return null;
+  if (Number(task.doneAt) > 0) return Number(task.doneAt);
+  if (task.doneDate) {
+    let best = 0;
+    (state.history || []).forEach((h) => {
+      if (h && h.event === 'completed' && h.taskId === task.id && h.date === task.doneDate && Number(h.ts) > best) best = Number(h.ts);
+    });
+    if (best > 0) return best;
+    const end = new Date(task.doneDate + 'T23:59:59').getTime();
+    if (Number.isFinite(end)) return end;
+  }
+  return null;
+}
+
+/**
+ * 完了から ttlMs 以上たった単発タスクを state.tasks から取り除く。
+ * @returns {Array} 取り除いたタスク。doneAt が無い古いデータには、ここで推定した完了時刻を書き込む
+ *   （完了日すら無い場合は「いま」を書いて、そこから24時間数える）。
+ */
+export function purgeExpiredCompleted(state, nowMs = Date.now(), ttlMs = COMPLETED_TTL_MS) {
+  const removed = [];
+  state.tasks.forEach((t) => {
+    if (t.type === 'weekly' || !t.done) return;
+    let at = completedAtOf(state, t);
+    if (at == null) at = nowMs;
+    if (nowMs - at >= ttlMs) removed.push(t);
+    else if (!(Number(t.doneAt) > 0)) t.doneAt = Math.round(at);
+  });
+  if (removed.length) {
+    const gone = new Set(removed.map((t) => t.id));
+    state.tasks = state.tasks.filter((t) => !gone.has(t.id));
+  }
+  return removed;
 }
 
 /* ------------------------------------------------------------
