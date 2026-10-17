@@ -1455,16 +1455,71 @@ function testV1111() {
     assert(st.history.filter((h) => h.taskId === t.id).length === 0 && !(st.stats.weekday[wd] && st.stats.weekday[wd].completed > 0), '[v1111] 取り消しで履歴/統計が戻らない', {});
   }
 
-  // 6) 今日の負荷の表示値: 消化 + 残り が、リングの外側の弧と同じ値になること（app.js の計算式と同じ）
+  // 6) 超過量の計算（分子の扱いは v1.11.2 の Part N で検証）
   for (const [done, pending, cap] of [[6, 9, 15], [0, 14, 14], [10, 4, 15], [3, 15, 15], [0, 24, 15]]) {
     const total = done + pending;
-    const over = Math.max(0, total - cap);
+    const over = Planner.summarizeTodayLoad(done, pending, cap).over;
     assert(total - over <= cap && (over === 0) === (total <= cap), '[v1111] 超過量の計算', { done, pending, cap });
   }
 }
 
 console.log('=== PART M: v1.11.1（分母の固定・容量超過・24時間削除・並び順） ===');
 testV1111();
+
+
+// ============================================================
+// PART N — v1.11.2: 今日の負荷の分子は「完了したタスクの負荷だけ」
+// ============================================================
+function testV1112() {
+  const today = '2026-10-14';
+  const mk = (id, title, load, o = {}) => ({ id, title, description: '', type: 'once', load, deadline: null, unlockDate: null, weekDays: [], doneDates: [], done: false, doneDate: null, pattern: null, createdAt: 1, ...o });
+  // 画面と同じ手順: 今日の選定 → 完了分と残りを数え直す → summarizeTodayLoad
+  const view = (tasks, cap) => {
+    const plan = Planner.buildTodayPlan({ tasks, todayStr: today, baseCapacity: cap, alreadyDoneLoad: tasks.filter((t) => t.done && t.doneDate === today).reduce((s, t) => s + t.load, 0) });
+    const doneLoad = tasks.filter((t) => t.type !== 'weekly' && t.done && t.doneDate === today).reduce((s, t) => s + t.load, 0);
+    const pendingLoad = plan.entries.reduce((s, e) => s + e.load, 0);
+    return { plan, ...Planner.summarizeTodayLoad(doneLoad, pendingLoad, plan.totalCapacity) };
+  };
+
+  const tasks = [mk('a', '英単語 暗記', 3), mk('b', '古文 読解', 4), mk('c', '数学 標準問題', 5), mk('d', '化学 復習ワーク', 2)];
+  const v0 = view(tasks, 14);
+  assert(v0.numerator === 0, '[v1112] 何も終えていないのに分子が0でない', { n: v0.numerator });
+
+  // 1件ずつ完了させるたびに、分子は「完了したタスクの負荷」の合計まで増える（残りや選定の合計では動かない）
+  const order = v0.plan.entries.map((e) => e.id);
+  let expected = 0, prev = -1;
+  const work = tasks.map((t) => ({ ...t }));
+  order.forEach((id) => {
+    const t = work.find((x) => x.id === id);
+    t.done = true; t.doneDate = today; expected += t.load;
+    const v = view(work, 14);
+    assert(v.numerator === expected, '[v1112] 分子が完了済みの負荷の合計と一致しない', { id, n: v.numerator, expected });
+    assert(v.numerator > prev, '[v1112] 完了させても分子が増えない', { id, n: v.numerator, prev });
+    prev = v.numerator;
+  });
+
+  // 未完了のタスクを足しても、分子は動かない（残りが変わるだけ）
+  const w2 = [mk('a', '英単語 暗記', 3, { done: true, doneDate: today }), mk('b', '古文 読解', 4)];
+  const before = view(w2, 10);
+  const after = view([...w2, mk('z', '物理 原因を考える', 3)], 10);
+  assert(before.numerator === 3 && after.numerator === 3, '[v1112] 未完了を足したら分子が動いた', { before: before.numerator, after: after.numerator });
+  assert(after.remaining >= before.remaining, '[v1112] 残り負荷が増えない', {});
+
+  // 完了の取り消しで分子が戻る
+  w2[0].done = false; w2[0].doneDate = null;
+  assert(view(w2, 10).numerator === 0, '[v1112] 取り消しで分子が戻らない', {});
+
+  // 別の日に完了したものは数えない／週次は今日の分だけ（doneLoadの定義は app.js の computeDoneLoadToday と同じ）
+  const yest = [mk('y', '昨日の分', 6, { done: true, doneDate: '2026-10-13' })];
+  assert(view(yest, 10).numerator === 0, '[v1112] 昨日完了した分を今日の分子に数えた', {});
+
+  // 不正値でも壊れない
+  const bad = Planner.summarizeTodayLoad(NaN, -3, undefined);
+  assert(bad.numerator === 0 && bad.remaining === 0 && bad.over === 0, '[v1112] 不正値の扱い', { bad });
+}
+
+console.log('=== PART N: v1.11.2（今日の負荷の分子） ===');
+testV1112();
 
 console.log('\n=== 結果 ===');
 console.log(`総アサーション数: ${assertionCount}`);

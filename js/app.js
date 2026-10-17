@@ -14,7 +14,7 @@ import * as Forecast from './forecast.js';
 import * as Schedule from './schedule.js';
 import { createSyncEngine, historyCutoff } from './sync-core.js';
 import { createSky } from './skyrender.js';
-import { initViewport, viewportDebugHtml } from './viewport.js';
+import { initViewport } from './viewport.js';
 
 /* ------------------------------------------------------------
    状態
@@ -28,7 +28,7 @@ let pendingImport = null;  // インポート確認中のデータ
 let upcomingDay = 1;       // 予定タブで選んでいる日（1=明日 … 7=7日後）
 
 /** 設定タブに小さく表示するだけの表示用バージョン。改修のたびに上げる。 */
-const APP_VERSION = 'v1.11.1';
+const APP_VERSION = 'v1.11.2';
 
 const todayStr = () => {
   const d = new Date();
@@ -337,9 +337,10 @@ function renderTodayPage() {
   // タスクがまだ残っている）。pendingEntries（未完了のみ）から
   // 合計し直すことで二重計上を避ける。
   const pendingLoad = pendingEntries.reduce((sum, e) => sum + e.load, 0);
-  const totalLoad = doneLoad + pendingLoad;
-  // 表示の「今日の負荷」は 消化 + 残り（リングの外側の弧と同じ値）。以前は残りだけを分子にしていたため、
-  // 消化がある日は文字(例 9 / 15)とリング(満杯)が食い違って見えた。
+  const totalLoad = doneLoad + pendingLoad; // リングの外側の弧（選定の合計）。文字の分子には使わない
+  // 表示の「今日の負荷」の分子は、完了したタスクの負荷だけ（v1.11.2）。
+  // v1.11.1 は 消化 + 残り(=選定の合計) にしたため、完了させても値が動かなかった。
+  // 完了のたびに増え、分母（今日の容量）に近づくほど達成に近い、が一目で分かる値にする。
   // 分母は「今日1日の目標容量」(fullCapacity)。plan.effectiveCapacity は
   // Plannerが残りタスクを選ぶ際に使った「まだ使っていない予算」
   // （fullCapacityからdoneLoadを引いたもの）なので、表示の分母には使わない
@@ -351,7 +352,7 @@ function renderTodayPage() {
   const plannedOffset = C * (1 - frac(totalLoad));
   const doneOffset = C * (1 - frac(doneLoad));
   // 容量を超えた分は、内側の細いリングで見せる（外側は100%で頭打ちになり、超過が見えなかった）
-  const overLoad = capacity > 0 ? Math.max(0, totalLoad - capacity) : 0;
+  const overLoad = Planner.summarizeTodayLoad(doneLoad, pendingLoad, capacity).over;
   const C2 = 2 * Math.PI * 17;
   const overOffset = C2 * (1 - Math.min(1, overLoad / capacity));
 
@@ -387,8 +388,8 @@ function renderTodayPage() {
           ${overLoad > 0 ? `<circle class="load-ring-over" cx="27" cy="27" r="17" stroke-dasharray="${C2}" stroke-dashoffset="${overOffset}" transform="rotate(-90 27 27)"/>` : ''}
         </svg>
         <div class="progress-text">
-          <div class="progress-value">今日の負荷　<b>${totalLoad}</b> / ${capacity}</div>
-          <div class="progress-sub">${pendingEntries.length}件が残っています${doneLoad > 0 ? `　（消化 ${doneLoad}）` : ''}${overLoad > 0 ? `　超過 +${overLoad}` : ''}</div>
+          <div class="progress-value">今日の負荷　<b>${Planner.summarizeTodayLoad(doneLoad, pendingLoad, capacity).numerator}</b> / ${capacity}</div>
+          <div class="progress-sub">${pendingEntries.length}件が残っています${pendingLoad > 0 ? `（残り負荷 ${pendingLoad}）` : ''}${overLoad > 0 ? `　超過 +${overLoad}` : ''}</div>
           ${finishLabel ? `<div class="progress-finish">全タスク完了目安 ${finishLabel}</div>` : ''}
         </div>
       </div>
@@ -982,7 +983,6 @@ function renderSettingsPage() {
     ${renderSyncCard()}
 
     <div class="settings-version">Temper ${APP_VERSION}</div>
-    ${viewportDebugHtml(esc)}
   `;
 }
 

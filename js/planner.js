@@ -1278,3 +1278,20 @@ export function explainSelection(entry) {
   if (entry.overCapacity) parts.push('容量を超えても今日中に扱う必要があるため');
   return parts.join('、');
 }
+
+
+/**
+ * 今日タブの「今日の負荷」表示の値（v1.11.2）。
+ * 分子は「完了したタスクの負荷だけ」。残りや選定の合計を混ぜると、完了させても値が動かない。
+ * @param {number} doneLoad 今日すでに完了したタスクの負荷の合計
+ * @param {number} pendingLoad まだ終えていない選定の負荷の合計
+ * @param {number} capacity 今日の容量（目標＋「追加で生成」の上乗せ）
+ * @returns {{numerator:number, remaining:number, total:number, over:number}}
+ *   numerator=分子（完了分）、remaining=残り負荷、total=完了+残り、over=容量を超える分
+ */
+export function summarizeTodayLoad(doneLoad, pendingLoad, capacity) {
+  const d = Number.isFinite(doneLoad) && doneLoad > 0 ? doneLoad : 0;
+  const r = Number.isFinite(pendingLoad) && pendingLoad > 0 ? pendingLoad : 0;
+  const c = Number.isFinite(capacity) && capacity > 0 ? capacity : 0;
+  return { numerator: d, remaining: r, total: d + r, over: c > 0 ? Math.max(0, d + r - c) : 0 };
+}
