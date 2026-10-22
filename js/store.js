@@ -1014,7 +1014,28 @@ export function deriveLearning(state) {
   const r = (b) => (b && b.planned > 0 ? { ratio: b.done / b.planned, n: b.planned } : null);
   const patternFollow = {};
   Object.entries(f.byPattern).forEach(([p, b]) => { const v = r(b); if (v) patternFollow[p] = v; });
-  return { patternFollow, heavyFollow: r(f.byLoad.heavy), overallFollow: r(f.overall) };
+  return { patternFollow, heavyFollow: r(f.byLoad.heavy), overallFollow: r(f.overall), lead: deriveLeadTendency(state) };
+}
+
+/**
+ * v1.12.0: 「期限の何日前に終えているか」の傾向（直近90日・期限つきの完了から）。
+ * 5件未満なら null（実績なし）。中央値なので、一度だけの極端な前倒し／ギリギリに引っ張られない。
+ * @returns {{median:number, n:number}|null}
+ */
+export function deriveLeadTendency(state, now = Date.now()) {
+  const since = now - 90 * 86400000;
+  const leads = [];
+  (state.history || []).forEach((h) => {
+    if (!h || h.event !== 'completed' || typeof h.deadline !== 'string' || typeof h.date !== 'string') return;
+    if (Number(h.ts) && Number(h.ts) < since) return;
+    const lead = Math.round((new Date(h.deadline + 'T00:00:00') - new Date(h.date + 'T00:00:00')) / 86400000);
+    if (Number.isFinite(lead)) leads.push(Math.max(0, Math.min(14, lead)));
+  });
+  if (leads.length < 5) return null;
+  leads.sort((a, b) => a - b);
+  const m = leads.length >> 1;
+  const median = leads.length % 2 ? leads[m] : (leads[m - 1] + leads[m]) / 2;
+  return { median, n: leads.length };
 }
 
 function localDateStr(d) {

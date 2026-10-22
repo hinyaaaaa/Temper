@@ -566,7 +566,7 @@ export function buildTodayPlan({
       recentPenalty += Math.min(8, 3 * (finished.recent.books[t._book] || 0));
       recentPenalty += Math.min(4, 1.2 * (finished.recent.patterns[t._pattern] || 0));
     }
-    const followBonus = followBonusOf(t._pattern, learned);
+    const followBonus = tendencyBonusOf(t, { weekday, todayStr, weekdayPatternStats, learned }).total; // v1.12.0: 傾向への寄せ＋楽にしない歯止め
     return {
       task: t, deadlineScore, weekdayBonus, timeBonus, phaseBonus, pressureBonus, followBonus,
       value: Math.max(0.01, deadlineScore + weekdayBonus + timeBonus + phaseBonus + pressureBonus + followBonus - recentPenalty + 1), // +1: 期限なしタスクにも僅かな基礎価値を与える
@@ -723,6 +723,67 @@ function followBonusOf(pattern, learned) {
   if (!f || f.n < 6) return 0;
   const weight = Math.min(1, f.n / 20);
   return Math.max(-2.5, Math.min(2.5, (f.ratio - 0.7) * 8)) * weight;
+}
+
+/* ------------------------------------------------------------
+   v1.12.0: ユーザーの処理の傾向への「寄せ」と、楽に流れないための「歯止め」
+   ------------------------------------------------------------
+   寄せる（やり切りやすくする。合計 ±TENDENCY_COMFORT_CAP まで）
+     ① やり切りやすい認知タイプを少し優先、やり切れないタイプは少し後ろ（v1.10.0 から）
+     ② 先送りしがちな認知タイプは、除外せず「その人が一番やり切れている曜日」へ寄せる
+        （曜日×認知タイプの実績から。得意な曜日は上げ、苦手な曜日は下げる）
+   歯止め（楽にしない。合計 0〜TENDENCY_PUSH_CAP まで。マイナスにはならない）
+     ③ 余裕をもって着手: 期限の「バッファ日数」前から少しずつ前へ出す。最低1日、重い(7以上)は+1日、
+        普段から早めに終える人はその分広く（lead の中央値3日ごとに+1日、最大4日）
+     ④ 先送りエイジング: 登録から日が経ったまま残っているものを少しずつ上げる（3日目から1日+0.25、最大+2）。
+        苦手なタイプだけが永久に後回しにならないための下支え
+   どちらも期限の近さ（最大60点）や締切への間に合い具合を覆さない小さな重みに抑える。
+   実績が足りないうちは寄せは0（①は6件、②は6件＋曜日5件、③の広げ幅は5件）。歯止め③の最低1日と④は実績なしでも効く。
+   ------------------------------------------------------------ */
+const TENDENCY_COMFORT_CAP = 3;
+const TENDENCY_PUSH_CAP = 4;
+const AVOIDED_RATIO = 0.6;
+
+/** 期限の何日前から着手を前に出すか（余裕をもつ幅）。実績なしでも最低1日 */
+export function leadBufferOf(learned, load) {
+  const lead = learned && learned.lead;
+  const habit = lead && lead.n >= 5 && Number.isFinite(lead.median) ? Math.max(0, lead.median) : 0;
+  let buf = 1 + Math.floor(habit / 3);
+  if (safeLoad(load) >= 7) buf += 1;
+  return Math.min(4, buf);
+}
+
+/** 登録からの経過日数（todayStr 基準。未来や不正値は0） */
+export function ageDaysOf(task, todayStr) {
+  const c = Number(task && task.createdAt);
+  if (!Number.isFinite(c) || c <= 0) return 0;
+  const d = new Date(c);
+  const cs = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  return Math.max(0, daysUntil(todayStr, cs));
+}
+
+/**
+ * @returns {{comfort:number, push:number, total:number}} 加点（comfort は±、push は0以上）
+ */
+export function tendencyBonusOf(t, { weekday, todayStr, weekdayPatternStats = null, learned = null }) {
+  let comfort = followBonusOf(t._pattern, learned);
+  const f = learned && learned.patternFollow && learned.patternFollow[t._pattern];
+  if (f && f.n >= 6 && f.ratio < AVOIDED_RATIO) {
+    comfort += weekdayPatternBonus(t._pattern, weekday, weekdayPatternStats) * 0.5;
+  }
+  comfort = Math.max(-TENDENCY_COMFORT_CAP, Math.min(TENDENCY_COMFORT_CAP, comfort));
+
+  let push = 0;
+  if (t.type !== 'weekly' && Number.isFinite(t._daysUntil) && t._daysUntil > 0) {
+    const buf = leadBufferOf(learned, t.load);
+    if (t._daysUntil <= buf) push += Math.min(2, (buf - t._daysUntil + 1) * 0.7);
+  }
+  if (t.type !== 'weekly') {
+    const age = ageDaysOf(t, todayStr);
+    if (age >= 3) push += Math.min(2, (age - 2) * 0.25);
+  }
+  push = Math.max(0, Math.min(TENDENCY_PUSH_CAP, push));
+  return { comfort, push, total: comfort + push };
 }
 
 /** 重い(負荷7以上)タスクをいつもやり切れない人は、1日1件までにする（実績が十分あるときだけ） */

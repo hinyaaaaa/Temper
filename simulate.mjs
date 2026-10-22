@@ -178,7 +178,9 @@ function fuzzSingleDay(rng, iterations) {
         // pressureBonus=0（capacityForDate未指定）。時期補正（締切からの逆算）だけは
         // 常に効くため、Plannerと同じ公開関数で算出して突き合わせる。
         const pattern = t.pattern || Planner.estimatePattern(t.title, t.description, []);
-        const value = Math.max(0.01, deadlineScore + Planner.deadlinePhaseBonus(pattern, du) + 1);
+        // v1.12.0: 傾向の加点（歯止め: 余裕日数・エイジング）も Planner と同じ公開関数で突き合わせる
+        const tb = Planner.tendencyBonusOf({ ...t, _pattern: pattern, _daysUntil: du }, { weekday: new Date(todayStr + 'T00:00:00').getDay(), todayStr }).total;
+        const value = Math.max(0.01, deadlineScore + Planner.deadlinePhaseBonus(pattern, du) + tb + 1);
         return { load: Math.max(1, Math.round(t.load || 1)), value, id: t.id };
       });
       const bruteBest = bruteForceKnapsack(items, plainRemainingCap);
@@ -1171,13 +1173,51 @@ function testV1100() {
     // 最新の状況: タスクを足すと次の投影に反映される
     const added = Schedule.projectDays({ ...args, tasks: [...tasks, mk('n', '明後日提出', 4, { deadline: addDays(today, 2) })] });
     assert(added.slice(0, 2).some((d) => d.plan.entries.some((e) => e.id === 'n')), '[v1100-proj] 追加したタスクが期限までの予定に出ない', {});
-    // 持ち越し: やり切り率が低いと、先送りされたタスクが翌日以降に残る
-    const few = [mk('c1', '教材A', 3), mk('c2', '教材B', 3), mk('c3', '教材C', 3)];
-    const low = Schedule.projectDays({ tasks: few, todayStr: today, days: 3, todayPendingIds: [], capacityForDate: () => 9, learned: { overallFollow: { ratio: 0.4, n: 20 }, patternFollow: {}, heavyFollow: null } });
-    const full = Schedule.projectDays({ tasks: few, todayStr: today, days: 3, todayPendingIds: [], capacityForDate: () => 9 });
-    const count = (r) => r.map((d) => d.plan.entries.length);
-    assert(count(full)[0] === 3 && count(full)[1] === 0, '[v1100-proj] 満額の前提で翌日に残る', { c: count(full) });
-    assert(count(low)[1] > 0, '[v1100-proj] やり切り率が低いのに持ち越されない', { c: count(low) });
+    // v1.12.0: やり切り率が低くても同じ単発タスクは複数日に出ない（持ち越しの廃止）
+    const few = [mk('c1', '教材A', 3), mk('c2', '教材B', 3), mk('c3', '教材C', 3), mk('c4', '教材D', 3), mk('c5', '教材E', 3)];
+    const low = Schedule.projectDays({ tasks: few, todayStr: today, days: 5, todayPendingIds: ['c1'], capacityForDate: () => 6, learned: { overallFollow: { ratio: 0.4, n: 20 }, patternFollow: {}, heavyFollow: null } });
+    const seen = new Map();
+    low.forEach((d) => d.plan.entries.forEach((e) => seen.set(e.id, (seen.get(e.id) || 0) + 1)));
+    assert([...seen.values()].every((n) => n === 1), '[v1120] 単発タスクが複数日に出た', { seen: [...seen] });
+    assert(!seen.has('c1'), '[v1120] 今日済ませる分が明日以降にも出た', {});
+  }
+
+  // v1.12.0: 傾向の寄せと歯止め
+  {
+    const mkT = (id, title, load, extra = {}) => ({ ...mk(id, title, load, extra) });
+    const base = { _pattern: 'reading', _daysUntil: Infinity };
+    const t0 = { ...mkT('a', 'x', 3), ...base, createdAt: Date.now() };
+    const none = Planner.tendencyBonusOf(t0, { weekday: 1, todayStr: today, learned: null });
+    assert(none.total === 0, '[v1120] 実績も経過もないのに加点された', { none });
+    // 歯止め: 期限が近いほど（バッファ内）前へ。実績なしでも最低1日
+    const near = Planner.tendencyBonusOf({ ...t0, _daysUntil: 1 }, { weekday: 1, todayStr: today, learned: null });
+    const far = Planner.tendencyBonusOf({ ...t0, _daysUntil: 9 }, { weekday: 1, todayStr: today, learned: null });
+    assert(near.push > 0 && far.push === 0, '[v1120] 期限前の余裕の加点が効かない', { near, far });
+    // 普段から早く終える人は前倒し幅が広い／重いものは+1日／上限4
+    assert(Planner.leadBufferOf({ lead: { median: 6, n: 10 } }, 3) === 3 && Planner.leadBufferOf(null, 8) === 2 && Planner.leadBufferOf({ lead: { median: 99, n: 9 } }, 9) === 4, '[v1120] 余裕日数の計算', {});
+    assert(Planner.leadBufferOf({ lead: { median: 6, n: 2 } }, 3) === 1, '[v1120] 実績不足なのに広がった', {});
+    // 先送りエイジング: 古いほど上がる（上限あり）。週次は対象外
+    const old = (days) => ({ ...t0, createdAt: new Date(today + 'T00:00:00').getTime() - days * 86400000 });
+    const a2 = Planner.tendencyBonusOf(old(2), { weekday: 1, todayStr: today }).push;
+    const a10 = Planner.tendencyBonusOf(old(10), { weekday: 1, todayStr: today }).push;
+    const a99 = Planner.tendencyBonusOf(old(99), { weekday: 1, todayStr: today }).push;
+    assert(a2 === 0 && a10 > a2 && a99 === 2, '[v1120] エイジングの効き方', { a2, a10, a99 });
+    assert(Planner.tendencyBonusOf({ ...old(50), type: 'weekly' }, { weekday: 1, todayStr: today }).push === 0, '[v1120] 週次にエイジングが効いた', {});
+    // 寄せ: 先送りしがちなタイプは、得意な曜日で上がり苦手な曜日で下がる。合計は±3まで
+    const learned = { patternFollow: { reading: { ratio: 0.2, n: 30 } }, heavyFollow: null, overallFollow: null };
+    const wps = { '1:reading': { completedRatio: 1, samples: 20 }, '2:reading': { completedRatio: 0.1, samples: 20 } };
+    const good = Planner.tendencyBonusOf(t0, { weekday: 1, todayStr: today, weekdayPatternStats: wps, learned }).comfort;
+    const bad = Planner.tendencyBonusOf(t0, { weekday: 2, todayStr: today, weekdayPatternStats: wps, learned }).comfort;
+    assert(good > bad && Math.abs(good) <= 3 && Math.abs(bad) <= 3, '[v1120] 曜日への寄せ', { good, bad });
+    // 先送りしがちなタイプでも、除外はされない（容量があれば入る）
+    const p = Planner.buildTodayPlan({ tasks: [mkT('r', '古文 読解', 2)], todayStr: today, baseCapacity: 5, learned, weekdayPatternStats: wps });
+    assert(p.entries.length === 1, '[v1120] 苦手なタイプが完全に外れた', {});
+    // 傾向の導出: 期限つき完了の「何日前」の中央値。5件未満はnull
+    const st = Store.normalizeState({ tasks: [], history: [], settings: {}, stats: {} });
+    assert(Store.deriveLeadTendency(st) === null, '[v1120] 実績なしでnullでない', {});
+    [4, 2, 6, 3, 3].forEach((n, i) => st.history.push({ taskId: 'h' + i, event: 'completed', deadline: addDays(today, n), date: today, ts: Date.now(), load: 3 }));
+    const lt = Store.deriveLeadTendency(st);
+    assert(lt && lt.median === 3 && lt.n === 5 && Store.deriveLearning(st).lead.median === 3, '[v1120] 先行度の中央値', { lt });
   }
 
   // 壊れた/古いstateを正規化してもfollowが必ず揃う

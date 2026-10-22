@@ -1,17 +1,18 @@
 /* ============================================================
-   schedule.js — 明日以降の予定（見通し）の投影（v1.10.0 新設）
+   schedule.js — 明日以降の予定（見通し）の投影（v1.10.0 新設 / v1.12.0 で組み方を変更）
    ------------------------------------------------------------
    純粋関数のみ（DOM・保存領域に触れない。憲法6条）。
-   「今日のおすすめを（その人のやり切り傾向どおりに）進めたら、
-   明日以降はこうなる」を、1日ずつ順に計算して返す。
+   「今日のおすすめを進めたら、明日以降はこうなる」を、1日ずつ順に計算して返す。
 
    ・今日の分は、いまの今日のおすすめ（未完了）をその日に進める前提で置く。
-   ・各日は Planner.buildTodayPlan を、その日付で呼んで作る。
-     今日と違い固定(pin)はしない。タスクの追加・完了・容量の変更・
-     学習した傾向の更新があれば、次に呼んだときに最新の状況で並びごと計算し直す。
-   ・「その日の分を全部終える」とは仮定しない。その人の全体のやり切り率
-     （learned.overallFollow、6件以上の実績があるときだけ。無ければ100%）の分だけ
-     先頭から終えたものとし、残りは翌日以降へ持ち越す。
+   ・各日は Planner.buildTodayPlan を、その日付で呼んで作る。固定(pin)はしない。
+     追加・完了・容量の変更・学習した傾向の更新があれば、次に呼んだときに最新の状況で組み直す。
+   ・v1.12.0: 単発タスクは「置いた日に済ませたもの」として必ず1回だけ置く。
+     以前はその人のやり切り率だけ先頭から終えたことにして残りを翌日へ持ち越していたため、
+     同じタスクが複数の日付に並び、予定が正確でなかった。持ち越しはやめ、置かれなかった
+     タスクは単に後の日の候補に残る。週次は曜日ごとに出る（毎回その日に済ませたもの扱い）。
+   ・ユーザーの傾向への寄せと「楽にしない歯止め」は buildTodayPlan の tendencyBonusOf が担う
+     （learned を渡すだけ。weekdayPatternStats も同様）。
    ・日ごとの空の見通し(pressure)も同じ状態から計算する。
    ============================================================ */
 import { buildTodayPlan, isTaskPendingOn } from './planner.js';
@@ -53,11 +54,9 @@ export function projectDays({
 }) {
   const sim = tasks.map((t) => ({ ...t, doneDates: Array.isArray(t.doneDates) ? [...t.doneDates] : [] }));
   const byId = new Map(sim.map((t) => [t.id, t]));
-  const overall = learned && learned.overallFollow && learned.overallFollow.n >= 6 ? learned.overallFollow.ratio : 1;
-  const followRatio = Math.max(0.4, Math.min(1, overall));
 
-  // 今日の残りは、やり切り率の分だけ今日のうちに進む
-  carryOut(todayPendingIds.map((id) => byId.get(id)).filter(Boolean), todayStr, followRatio);
+  // 今日の残りは今日のうちに進む（以降の日には出さない）
+  placeAll(todayPendingIds.map((id) => byId.get(id)).filter(Boolean), todayStr);
 
   const out = [];
   for (let i = 1; i <= days; i++) {
@@ -73,21 +72,15 @@ export function projectDays({
       alreadyDoneLoad: 0, todayPendingLoad: plan.totalLoad, todayCapacity: plan.totalCapacity,
     });
     out.push({ date, offset: i, plan, pressure: f.pressure, load: plan.totalLoad, capacity: plan.totalCapacity });
-    carryOut(plan.entries.map((e) => byId.get(e.id)).filter(Boolean), date, followRatio);
+    placeAll(plan.entries.map((e) => byId.get(e.id)).filter(Boolean), date);
   }
   return out;
 }
 
-/** 表示順に、負荷の合計が ratio 分に達するまでを終えたことにする（残りは持ち越し） */
-function carryOut(list, dateStr, ratio) {
-  const total = list.reduce((s, t) => s + Math.max(1, Number(t.load) || 1), 0);
-  const target = total * ratio;
-  let acc = 0;
+/** その日に置いたタスクは、その日に済ませたものとして以降の日から外す（単発の重複を防ぐ） */
+function placeAll(list, dateStr) {
   for (const t of list) {
     if (!isTaskPendingOn(t, dateStr)) continue;
-    // 週次は終えなくても翌週にまた戻るので、ここでは「その日は済んだ」扱いで進める
-    if (t.type !== 'weekly' && acc >= target - 1e-9 && ratio < 1) continue;
     finishOn(t, dateStr);
-    acc += Math.max(1, Number(t.load) || 1);
   }
 }

@@ -28,7 +28,7 @@ let pendingImport = null;  // インポート確認中のデータ
 let upcomingDay = 1;       // 予定タブで選んでいる日（1=明日 … 7=7日後）
 
 /** 設定タブに小さく表示するだけの表示用バージョン。改修のたびに上げる。 */
-const APP_VERSION = 'v1.11.2';
+const APP_VERSION = 'v1.12.0';
 
 const todayStr = () => {
   const d = new Date();
