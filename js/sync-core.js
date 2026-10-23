@@ -19,6 +19,9 @@
    ============================================================ */
 export const HISTORY_DAYS = 120;
 
+/** v1.12.1: 届いたタスク文書のIDの検査（store.js の isValidTaskId と同じ規則）。不正なIDの文書は取り込まない */
+const TASK_ID_RE = /^[A-Za-z0-9_.:@-]{1,100}$/;
+
 /** 同期する履歴の最も古い日（YYYY-MM-DD） */
 export function historyCutoff(nowMs = Date.now()) {
   const d = new Date(nowMs); d.setDate(d.getDate() - HISTORY_DAYS);
@@ -134,6 +137,7 @@ export function createSyncEngine(o) {
     const state = o.getState();
     try {
       if (doc.kind === 'task') {
+        if (typeof doc.id !== 'string' || !TASK_ID_RE.test(doc.id)) return false;
         const m = meta.tasks[doc.id];
         const local = state.tasks.find((x) => x.id === doc.id);
         if (local && m && !m.d && hashOf(local) !== m.h) return false; // 未送信の手元の変更を優先

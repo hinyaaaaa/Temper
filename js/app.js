@@ -28,7 +28,7 @@ let pendingImport = null;  // インポート確認中のデータ
 let upcomingDay = 1;       // 予定タブで選んでいる日（1=明日 … 7=7日後）
 
 /** 設定タブに小さく表示するだけの表示用バージョン。改修のたびに上げる。 */
-const APP_VERSION = 'v1.12.0';
+const APP_VERSION = 'v1.12.1';
 
 const todayStr = () => {
   const d = new Date();
@@ -278,10 +278,13 @@ function render() {
    小さなユーティリティ
    ------------------------------------------------------------ */
 function esc(s) {
-  const d = document.createElement('div');
-  d.textContent = s == null ? '' : String(s);
-  return d.innerHTML;
+  // v1.12.1: 属性値（"..."）の中でも安全に使えるよう、引用符も変換する
+  return (s == null ? '' : String(s))
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
+// onclick / data 属性に埋め込むID用。許可文字以外は取り除く（store.js の isValidTaskId と同じ文字種）
+function attrId(id) { return String(id == null ? '' : id).replace(/[^A-Za-z0-9_.:@-]/g, ''); }
 
 function formatDateLabel(dateStr) {
   const d = new Date(dateStr + 'T00:00:00');
@@ -562,10 +565,10 @@ function renderTaskCard(entryOrTask, opts = {}) {
 
   const actions = opts.withActions ? `
       <div class="task-list-actions">
-        <button class="icon-btn" onclick="event.stopPropagation();Temper.openEditTask('${t.id}')" aria-label="編集">
+        <button class="icon-btn" onclick="event.stopPropagation();Temper.openEditTask('${attrId(t.id)}')" aria-label="編集">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5"/><path d="M18.5 2.5a2.1 2.1 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
         </button>
-        <button class="icon-btn" onclick="event.stopPropagation();Temper.deleteTask('${t.id}')" aria-label="削除">
+        <button class="icon-btn" onclick="event.stopPropagation();Temper.deleteTask('${attrId(t.id)}')" aria-label="削除">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="3,6 5,6 21,6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>
         </button>
       </div>` : '';
@@ -576,11 +579,11 @@ function renderTaskCard(entryOrTask, opts = {}) {
          onmousedown="Temper.onCardPressStart('${t.id}')" onmouseup="Temper.onCardPressEnd()" onmouseleave="Temper.onCardPressEnd()"`;
   const checkHtml = opts.preview
     ? '<span class="task-check preview" aria-hidden="true"></span>'
-    : `<button class="task-check${doneToday ? ' checked' : ''}" onclick="event.stopPropagation();Temper.toggleTask('${t.id}')" aria-label="${doneToday ? '未完了に戻す' : '完了にする'}">
+    : `<button class="task-check${doneToday ? ' checked' : ''}" onclick="event.stopPropagation();Temper.toggleTask('${attrId(t.id)}')" aria-label="${doneToday ? '未完了に戻す' : '完了にする'}">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20,6 9,17 4,12"/></svg>
       </button>`;
   return `
-    <div class="task-card glass${doneToday ? ' done' : ''}" data-task-id="${t.id}"${pressAttrs}>
+    <div class="task-card glass${doneToday ? ' done' : ''}" data-task-id="${attrId(t.id)}"${pressAttrs}>
       ${checkHtml}
       <div class="task-main">
         <div class="task-title">${esc(t.title)}</div>
@@ -688,7 +691,7 @@ function toggleTask(taskId) {
     return;
   }
 
-  const cardEl = document.querySelector(`.task-card[data-task-id="${taskId}"]`);
+  const cardEl = document.querySelector(`.task-card[data-task-id="${attrId(taskId)}"]`);
   if (cardEl && currentPage === 'today') cardEl.classList.add('completing');
   completingIds.add(taskId);
   const finish = () => {

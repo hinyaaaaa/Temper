@@ -163,7 +163,7 @@ export function normalizeState(state) {
 export function normalizeTask(t) {
   const type = t.type === 'weekly' ? 'weekly' : 'once';
   return {
-    id: String(t.id || newId()),
+    id: (t.id != null && isValidTaskId(String(t.id))) ? String(t.id) : newId(), // v1.12.1: 不正なIDは採番し直す
     title: String(t.title || ''),
     description: typeof t.description === 'string' ? t.description : '',
     deadline: t.deadline || null,
@@ -207,6 +207,16 @@ export function weekDaysLabel(weekDays) {
 
 export function newId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
+/**
+ * v1.12.1: タスクIDとして受け付ける文字（英数字と _ . : @ -）。
+ * IDは画面の onclick / data 属性に埋め込まれるため、引用符・空白・括弧などを含むIDは
+ * 取り込み（JSON・同期）の段階で受け付けない。
+ */
+const TASK_ID_RE = /^[A-Za-z0-9_.:@-]{1,100}$/;
+export function isValidTaskId(id) {
+  return typeof id === 'string' && TASK_ID_RE.test(id);
 }
 
 export function saveState(state) {
